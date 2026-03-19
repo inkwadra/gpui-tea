@@ -11,7 +11,7 @@ repository = "https://github.com/inkwadra/gpui-tea"
 homepage = "https://github.com/inkwadra/gpui-tea"
 documentation = "https://docs.rs/gpui_tea"
 keywords = ["gpui", "ui", "tea"]
-categories = ["development-tools"]
+categories = ["development-tools", "gui"]
 
 [dependencies]
 futures = "0.3.32"
