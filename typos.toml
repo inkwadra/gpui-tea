@@ -1,0 +1,16 @@
+[files]
+ignore-hidden = false
+extend-exclude = [".git/", "target/", "Cargo.lock"]
+
+[default]
+locale = "en-us"
+check-filename = true
+check-file = true
+unicode = true
+
+[default.extend-words]
+gpui = "gpui"
+
+[default.extend-identifiers]
+GPUI = "GPUI"
+MSRV = "MSRV"
