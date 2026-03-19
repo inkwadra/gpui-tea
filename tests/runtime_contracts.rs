@@ -2,10 +2,10 @@
 #![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
 
 use futures::channel::oneshot;
-use gpui::{App, Entity, IntoElement, TestAppContext, Window, div};
+use gpui::{App, Entity, TestAppContext, Window, div};
 use gpui_tea::{
-    Command, CommandKind, Dispatcher, Model, ModelExt, Program, ProgramConfig, RuntimeEvent,
-    SubHandle, Subscription, Subscriptions,
+    Command, CommandKind, Dispatcher, IntoView, Model, ModelExt, Program, ProgramConfig,
+    RuntimeEvent, SubHandle, Subscription, Subscriptions, View,
 };
 use std::{
     collections::VecDeque,
@@ -68,8 +68,8 @@ fn mount_runs_init_once_executes_initial_command_and_builds_initial_subscription
             _window: &mut Window,
             _cx: &mut App,
             _dispatcher: &Dispatcher<Self::Msg>,
-        ) -> impl IntoElement + use<> {
-            div()
+        ) -> View {
+            div().into_view()
         }
     }
 
@@ -121,8 +121,8 @@ fn dispatcher_preserves_fifo_delivery_for_enqueued_messages(cx: &mut TestAppCont
             _window: &mut Window,
             _cx: &mut App,
             _dispatcher: &Dispatcher<Self::Msg>,
-        ) -> impl IntoElement + use<> {
-            div()
+        ) -> View {
+            div().into_view()
         }
     }
 
@@ -137,6 +137,51 @@ fn dispatcher_preserves_fifo_delivery_for_enqueued_messages(cx: &mut TestAppCont
 
     program.read_with(cx, |program, _cx| {
         assert_eq!(program.model().trace, vec!["first", "second", "third"]);
+    });
+}
+
+#[gpui::test]
+fn program_accepts_models_that_render_through_view(cx: &mut TestAppContext) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Msg {
+        Increment,
+    }
+
+    struct ViewModel {
+        updates: usize,
+    }
+
+    impl Model for ViewModel {
+        type Msg = Msg;
+
+        fn update(&mut self, msg: Self::Msg, _cx: &mut App) -> Command<Self::Msg> {
+            match msg {
+                Msg::Increment => {
+                    self.updates += 1;
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            View::new(div())
+        }
+    }
+
+    let program: Entity<Program<ViewModel>> =
+        cx.update(|cx| ViewModel { updates: 0 }.into_program(cx));
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    dispatcher.dispatch(Msg::Increment).unwrap();
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().updates, 1);
     });
 }
 
@@ -193,8 +238,8 @@ fn reentrant_emits_append_to_queue_without_recursive_update_and_warn_on_growth(
             _window: &mut Window,
             _cx: &mut App,
             _dispatcher: &Dispatcher<Self::Msg>,
-        ) -> impl IntoElement + use<> {
-            div()
+        ) -> View {
+            div().into_view()
         }
     }
 
@@ -298,8 +343,8 @@ fn batch_executes_as_a_linear_sequence_and_skips_none(cx: &mut TestAppContext) {
             _window: &mut Window,
             _cx: &mut App,
             _dispatcher: &Dispatcher<Self::Msg>,
-        ) -> impl IntoElement + use<> {
-            div()
+        ) -> View {
+            div().into_view()
         }
     }
 
@@ -353,8 +398,8 @@ fn non_keyed_effects_and_optional_effects_complete_deterministically(cx: &mut Te
             _window: &mut Window,
             _cx: &mut App,
             _dispatcher: &Dispatcher<Self::Msg>,
-        ) -> impl IntoElement + use<> {
-            div()
+        ) -> View {
+            div().into_view()
         }
     }
 
@@ -386,10 +431,12 @@ fn non_keyed_effects_and_optional_effects_complete_deterministically(cx: &mut Te
         });
 
     let commands = VecDeque::from([
-        Command::spawn_opt(async { None }).label("foreground-none"),
+        Command::foreground(|_: &mut gpui::AsyncApp| async { None }).label("foreground-none"),
         Command::background(|_| async { None }).label("background-none"),
-        Command::spawn_opt(async move { foreground_rx.await.ok().map(Msg::Loaded) })
-            .label("foreground-some"),
+        Command::foreground(move |_: &mut gpui::AsyncApp| async move {
+            foreground_rx.await.ok().map(Msg::Loaded)
+        })
+        .label("foreground-some"),
         Command::background(move |_| async move { background_rx.await.ok().map(Msg::Loaded) })
             .label("background-some"),
     ]);
@@ -489,11 +536,13 @@ fn mapped_command_transforms_messages_and_preserves_keyed_observability(cx: &mut
         fn update(&mut self, msg: Self::Msg, _cx: &mut App) -> Command<Self::Msg> {
             match msg {
                 Msg::RunMapped => {
-                    Command::spawn_keyed("mapped-command", async { ChildMsg::Loaded(7) })
-                        .label("mapped-command")
-                        .map(|msg| match msg {
-                            ChildMsg::Loaded(value) => Msg::Loaded(value),
-                        })
+                    Command::foreground_keyed("mapped-command", |_: &mut gpui::AsyncApp| async {
+                        Some(ChildMsg::Loaded(7))
+                    })
+                    .label("mapped-command")
+                    .map(|msg| match msg {
+                        ChildMsg::Loaded(value) => Msg::Loaded(value),
+                    })
                 }
                 Msg::Loaded(value) => {
                     self.values.push(value);
@@ -507,8 +556,8 @@ fn mapped_command_transforms_messages_and_preserves_keyed_observability(cx: &mut
             _window: &mut Window,
             _cx: &mut App,
             _dispatcher: &Dispatcher<Self::Msg>,
-        ) -> impl IntoElement + use<> {
-            div()
+        ) -> View {
+            div().into_view()
         }
     }
 
@@ -599,8 +648,8 @@ fn keyed_effects_are_latest_wins_and_cancel_replaced_tasks(cx: &mut TestAppConte
             _window: &mut Window,
             _cx: &mut App,
             _dispatcher: &Dispatcher<Self::Msg>,
-        ) -> impl IntoElement + use<> {
-            div()
+        ) -> View {
+            div().into_view()
         }
     }
 
@@ -768,8 +817,8 @@ fn subscription_lifecycle_events_include_key_descriptions_and_labels_without_reb
             _window: &mut Window,
             _cx: &mut App,
             _dispatcher: &Dispatcher<Self::Msg>,
-        ) -> impl IntoElement + use<> {
-            div()
+        ) -> View {
+            div().into_view()
         }
     }
 
@@ -990,8 +1039,8 @@ fn subscriptions_are_retained_rebuilt_removed_and_can_dispatch_messages(cx: &mut
             _window: &mut Window,
             _cx: &mut App,
             _dispatcher: &Dispatcher<Self::Msg>,
-        ) -> impl IntoElement + use<> {
-            div()
+        ) -> View {
+            div().into_view()
         }
     }
 

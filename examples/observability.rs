@@ -4,7 +4,7 @@
 mod ui;
 
 use gpui::{App, Application, Bounds, Window, WindowBounds, WindowOptions, prelude::*, px, size};
-use gpui_tea::{Command, Dispatcher, Model, Program, ProgramConfig, RuntimeEvent};
+use gpui_tea::{Command, Dispatcher, IntoView, Model, Program, ProgramConfig, RuntimeEvent, View};
 use std::time::Duration;
 
 #[derive(Clone, Copy)]
@@ -58,7 +58,7 @@ impl Model for ObservedModel {
         _window: &mut Window,
         _cx: &mut App,
         dispatcher: &Dispatcher<Self::Msg>,
-    ) -> impl IntoElement + use<> {
+    ) -> View {
         let last_loaded = self
             .last_loaded
             .map_or_else(|| String::from("none yet"), |value| value.to_string());
@@ -117,6 +117,7 @@ impl Model for ObservedModel {
                         ),
                 ),
         )
+        .into_view()
     }
 }
 

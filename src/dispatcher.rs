@@ -1,4 +1,4 @@
-use crate::program::{ProgramConfig, RuntimeEvent};
+use crate::observability::{ProgramConfig, RuntimeEvent};
 use futures::channel::mpsc::UnboundedSender;
 use std::error::Error;
 use std::fmt;
@@ -127,7 +127,7 @@ impl<Msg> Clone for Dispatcher<Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::program::RuntimeEvent;
+    use crate::observability::RuntimeEvent;
     use futures::channel::mpsc::unbounded;
     use std::sync::{Arc, Mutex};
 

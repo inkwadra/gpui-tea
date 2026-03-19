@@ -4,7 +4,9 @@
 mod ui;
 
 use gpui::{App, Application, Bounds, Window, WindowBounds, WindowOptions, prelude::*, px, size};
-use gpui_tea::{Command, Dispatcher, Model, Program, SubHandle, Subscription, Subscriptions};
+use gpui_tea::{
+    Command, Dispatcher, IntoView, Model, Program, SubHandle, Subscription, Subscriptions, View,
+};
 
 #[derive(Clone, Copy)]
 enum Msg {
@@ -59,7 +61,7 @@ impl Model for SubscriptionDemo {
         _window: &mut Window,
         _cx: &mut App,
         dispatcher: &Dispatcher<Self::Msg>,
-    ) -> impl IntoElement + use<> {
+    ) -> View {
         let delivered = if self.delivered.is_empty() {
             String::from("none")
         } else {
@@ -123,6 +125,7 @@ impl Model for SubscriptionDemo {
                         ),
                 ),
         )
+        .into_view()
     }
 }
 

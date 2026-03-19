@@ -4,7 +4,7 @@
 mod ui;
 
 use gpui::{App, Application, Bounds, Window, WindowBounds, WindowOptions, prelude::*, px, size};
-use gpui_tea::{Command, Dispatcher, Model, Program};
+use gpui_tea::{Command, Dispatcher, IntoView, Model, Program, View};
 
 #[derive(Clone, Copy)]
 enum Msg {
@@ -43,7 +43,7 @@ impl Model for BootstrappedCounter {
         _window: &mut Window,
         _cx: &mut App,
         dispatcher: &Dispatcher<Self::Msg>,
-    ) -> impl IntoElement + use<> {
+    ) -> View {
         ui::AppFrame::new().child(
             ui::Card::new()
                 .child(ui::Text::new(
@@ -86,6 +86,7 @@ impl Model for BootstrappedCounter {
                         ),
                 ),
         )
+        .into_view()
     }
 }
 

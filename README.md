@@ -13,9 +13,9 @@ delivery, queue draining, async effect execution, keyed task replacement, and
 subscription reconciliation.
 
 The design stays intentionally GPUI-first. Models continue to work directly
-with GPUI's `App`, views render ordinary GPUI elements, and mounted programs
-remain standard GPUI entities rather than being wrapped in a separate UI
-abstraction.
+with GPUI's `App`, views return `gpui_tea::View` as a thin wrapper around
+ordinary GPUI elements, and mounted programs remain standard GPUI entities
+rather than being wrapped in a separate UI abstraction.
 
 This makes the crate suitable for applications that want explicit state
 transitions, controlled follow-up work, and long-lived external event sources,
@@ -45,7 +45,6 @@ while preserving direct access to GPUI's rendering and application model.
 ## Requirements
 
 - Stable Rust toolchain
-- MSRV: Rust 1.85.0
 - `clippy` and `rustfmt` are included in the repository toolchain configuration
 - GPUI has platform-specific system requirements; follow the upstream
   [`gpui` documentation](https://docs.rs/gpui/latest/gpui/) for environment setup details
@@ -80,14 +79,18 @@ The snippets below show the shape of the API. Each scenario has a corresponding
 runnable program in [`examples/`](examples) that keeps the full GPUI setup and
 UI code out of the README.
 
+`View` is the render boundary for `Model::view`. It stays GPUI-first by
+accepting any GPUI `IntoElement`, and `.into_view()` is the default ergonomic
+conversion in user code.
+
 ### Minimal program
 
 Start with a `Model` that owns state, updates in response to messages, renders
 GPUI elements, and mounts through `Program::mount`.
 
 ```rust
-use gpui::{App, IntoElement, Window, div};
-use gpui_tea::{Command, Dispatcher, Model};
+use gpui::{App, ParentElement, Window, div};
+use gpui_tea::{Command, Dispatcher, IntoView, Model, View};
 
 enum Msg {
     Increment,
@@ -113,8 +116,8 @@ impl Model for Counter {
         _window: &mut Window,
         _cx: &mut App,
         _dispatcher: &Dispatcher<Self::Msg>,
-    ) -> impl IntoElement + use<> {
-        div().child(self.value.to_string())
+    ) -> View {
+        div().child(self.value.to_string()).into_view()
     }
 }
 ```
@@ -127,8 +130,8 @@ Use `Model::init` when the mounted program should schedule work before handling
 normal user-driven messages.
 
 ```rust
-use gpui::App;
-use gpui_tea::{Command, Model};
+use gpui::{App, Window, div};
+use gpui_tea::{Command, Dispatcher, IntoView, Model, View};
 
 enum Msg {
     BootstrapLoaded,
@@ -146,6 +149,15 @@ impl Model for BootstrappedCounter {
     fn update(&mut self, _msg: Self::Msg, _cx: &mut App) -> Command<Self::Msg> {
         Command::none()
     }
+
+    fn view(
+        &self,
+        _window: &mut Window,
+        _cx: &mut App,
+        _dispatcher: &Dispatcher<Self::Msg>,
+    ) -> View {
+        div().into_view()
+    }
 }
 ```
 
@@ -157,8 +169,8 @@ Use keyed commands when later work should become authoritative for the same
 logical operation. Earlier completions on the same key are ignored as stale.
 
 ```rust
-use gpui::{App, IntoElement, Window, div};
-use gpui_tea::{Command, Dispatcher, Model};
+use gpui::{App, Window, div};
+use gpui_tea::{Command, Dispatcher, IntoView, Model, View};
 use std::time::Duration;
 
 enum Msg {
@@ -192,8 +204,8 @@ impl Model for Demo {
         _window: &mut Window,
         _cx: &mut App,
         _dispatcher: &Dispatcher<Self::Msg>,
-    ) -> impl IntoElement + use<> {
-        div()
+    ) -> View {
+        div().into_view()
     }
 }
 ```
@@ -207,8 +219,10 @@ Reusing a key retains the existing handle; changing it rebuilds the
 subscription.
 
 ```rust
-use gpui::App;
-use gpui_tea::{Command, Model, SubHandle, Subscription, Subscriptions};
+use gpui::{App, Window, div};
+use gpui_tea::{
+    Command, Dispatcher, IntoView, Model, SubHandle, Subscription, Subscriptions, View,
+};
 
 enum Msg {
     FromSubscription(&'static str),
@@ -234,6 +248,15 @@ impl Model for Demo {
             cx.dispatch(Msg::FromSubscription(key)).unwrap();
             SubHandle::None
         }))
+    }
+
+    fn view(
+        &self,
+        _window: &mut Window,
+        _cx: &mut App,
+        _dispatcher: &Dispatcher<Self::Msg>,
+    ) -> View {
+        div().into_view()
     }
 }
 ```

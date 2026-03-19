@@ -8,9 +8,9 @@
 //! and subscription reconciliation.
 //!
 //! The design stays intentionally GPUI-first. Models continue to work directly
-//! with GPUI's `App`, views render ordinary GPUI elements, and mounted programs
-//! remain standard GPUI entities rather than being wrapped in a separate UI
-//! abstraction.
+//! with GPUI's `App`, views return [`View`] as a thin wrapper around ordinary
+//! GPUI elements, and mounted programs remain standard GPUI entities rather
+//! than being wrapped in a separate UI abstraction.
 //!
 //! This makes the crate suitable for applications that want explicit state
 //! transitions, controlled follow-up work, and long-lived external event
@@ -37,8 +37,8 @@
 //! ## Examples
 //!
 //! ```no_run
-//! use gpui::{App, IntoElement, ParentElement, Window, div};
-//! use gpui_tea::{Command, Dispatcher, Model, Program};
+//! use gpui::{App, ParentElement, Window, div};
+//! use gpui_tea::{Command, Dispatcher, IntoView, Model, Program, View};
 //!
 //! #[derive(Clone, Copy)]
 //! enum Msg {
@@ -63,8 +63,8 @@
 //!         _window: &mut Window,
 //!         _cx: &mut App,
 //!         _dispatcher: &Dispatcher<Self::Msg>,
-//!     ) -> impl IntoElement + use<> {
-//!         div().child(self.0.to_string())
+//!     ) -> View {
+//!         div().child(self.0.to_string()).into_view()
 //!     }
 //! }
 //!
@@ -77,8 +77,8 @@
 //! [`Model::init`]:
 //!
 //! ```no_run
-//! use gpui::{App, IntoElement, Window, div};
-//! use gpui_tea::{Command, Dispatcher, Model};
+//! use gpui::{App, Window, div};
+//! use gpui_tea::{Command, Dispatcher, IntoView, Model, View};
 //!
 //! enum Msg {
 //!     BootstrapLoaded,
@@ -102,8 +102,8 @@
 //!         _window: &mut Window,
 //!         _cx: &mut App,
 //!         _dispatcher: &Dispatcher<Self::Msg>,
-//!     ) -> impl IntoElement + use<> {
-//!         div()
+//!     ) -> View {
+//!         div().into_view()
 //!     }
 //! }
 //! ```
@@ -112,8 +112,8 @@
 //! key:
 //!
 //! ```no_run
-//! use gpui::{App, IntoElement, Window, div};
-//! use gpui_tea::{Command, Dispatcher, Model};
+//! use gpui::{App, Window, div};
+//! use gpui_tea::{Command, Dispatcher, IntoView, Model, View};
 //! use std::time::Duration;
 //!
 //! enum Msg {
@@ -147,8 +147,8 @@
 //!         _window: &mut Window,
 //!         _cx: &mut App,
 //!         _dispatcher: &Dispatcher<Self::Msg>,
-//!     ) -> impl IntoElement + use<> {
-//!         div()
+//!     ) -> View {
+//!         div().into_view()
 //!     }
 //! }
 //! ```
@@ -156,8 +156,10 @@
 //! Subscriptions declare long-lived external inputs by stable key:
 //!
 //! ```no_run
-//! use gpui::{App, IntoElement, Window, div};
-//! use gpui_tea::{Command, Dispatcher, Model, SubHandle, Subscription, Subscriptions};
+//! use gpui::{App, Window, div};
+//! use gpui_tea::{
+//!     Command, Dispatcher, IntoView, Model, SubHandle, Subscription, Subscriptions, View,
+//! };
 //!
 //! enum Msg {
 //!     FromSubscription(&'static str),
@@ -190,8 +192,8 @@
 //!         _window: &mut Window,
 //!         _cx: &mut App,
 //!         _dispatcher: &Dispatcher<Self::Msg>,
-//!     ) -> impl IntoElement + use<> {
-//!         div()
+//!     ) -> View {
+//!         div().into_view()
 //!     }
 //! }
 //! ```
@@ -199,8 +201,10 @@
 //! [`ProgramConfig`] can attach runtime observers and format event payloads:
 //!
 //! ```no_run
-//! use gpui::{App, IntoElement, Window, div};
-//! use gpui_tea::{Command, Dispatcher, Model, Program, ProgramConfig, RuntimeEvent};
+//! use gpui::{App, Window, div};
+//! use gpui_tea::{
+//!     Command, Dispatcher, IntoView, Model, Program, ProgramConfig, RuntimeEvent, View,
+//! };
 //!
 //! enum Msg {
 //!     Run,
@@ -220,8 +224,8 @@
 //!         _window: &mut Window,
 //!         _cx: &mut App,
 //!         _dispatcher: &Dispatcher<Self::Msg>,
-//!     ) -> impl IntoElement + use<> {
-//!         div()
+//!     ) -> View {
+//!         div().into_view()
 //!     }
 //! }
 //!
@@ -245,12 +249,17 @@
 
 mod command;
 mod dispatcher;
+mod observability;
 mod program;
+mod runtime;
 mod subscription;
+mod view;
 
 pub use command::{Command, CommandKind, Key};
 pub use dispatcher::{DispatchError, Dispatcher};
-pub use program::{Model, ModelExt, Program, ProgramConfig, RuntimeEvent, RuntimeObserver};
+pub use observability::{ProgramConfig, RuntimeEvent, RuntimeObserver};
+pub use program::{Model, ModelExt, Program};
 pub use subscription::{
     SubHandle, Subscription, SubscriptionBuilder, SubscriptionContext, Subscriptions,
 };
+pub use view::{IntoView, View};

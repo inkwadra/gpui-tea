@@ -4,7 +4,7 @@
 mod ui;
 
 use gpui::{App, Application, Bounds, Window, WindowBounds, WindowOptions, prelude::*, px, size};
-use gpui_tea::{Command, Dispatcher, Model, Program};
+use gpui_tea::{Command, Dispatcher, IntoView, Model, Program, View};
 use std::time::Duration;
 
 #[derive(Clone, Copy)]
@@ -58,7 +58,7 @@ impl Model for KeyedEffectDemo {
         _window: &mut Window,
         _cx: &mut App,
         dispatcher: &Dispatcher<Self::Msg>,
-    ) -> impl IntoElement + use<> {
+    ) -> View {
         let applied = if self.applied.is_empty() {
             String::from("none yet")
         } else {
@@ -107,6 +107,7 @@ impl Model for KeyedEffectDemo {
                         ),
                 ),
         )
+        .into_view()
     }
 }
 
