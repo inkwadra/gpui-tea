@@ -270,6 +270,22 @@ impl<Msg: Send + 'static> Default for Subscriptions<Msg> {
     }
 }
 
+impl<Msg: Send + 'static> Extend<Subscription<Msg>> for Subscriptions<Msg> {
+    fn extend<T: IntoIterator<Item = Subscription<Msg>>>(&mut self, iter: T) {
+        for subscription in iter {
+            self.push(subscription);
+        }
+    }
+}
+
+impl<Msg: Send + 'static> FromIterator<Subscription<Msg>> for Subscriptions<Msg> {
+    fn from_iter<T: IntoIterator<Item = Subscription<Msg>>>(iter: T) -> Self {
+        let mut subscriptions = Self::none();
+        subscriptions.extend(iter);
+        subscriptions
+    }
+}
+
 impl<Msg: Send + 'static> From<Subscription<Msg>> for Subscriptions<Msg> {
     fn from(subscription: Subscription<Msg>) -> Self {
         Self::one(subscription)
@@ -288,7 +304,7 @@ impl<Msg: Send + 'static> IntoIterator for Subscriptions<Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::program::ProgramConfig;
+    use crate::ProgramConfig;
     use futures::{FutureExt, StreamExt, channel::mpsc::unbounded};
     use gpui::TestAppContext;
 
@@ -311,6 +327,23 @@ mod tests {
         let mut subscriptions =
             Subscriptions::one(Subscription::<()>::new("dup", |_| SubHandle::None));
         subscriptions.push(Subscription::<()>::new("dup", |_| SubHandle::None));
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    #[test]
+    fn from_iter_and_extend_preserve_uniqueness_and_order() {
+        let mut subscriptions: Subscriptions<()> =
+            [Subscription::new("alpha", |_| SubHandle::None)]
+                .into_iter()
+                .collect();
+        subscriptions.extend([Subscription::new("beta", |_| SubHandle::None)]);
+
+        let keys = subscriptions
+            .into_iter()
+            .map(|subscription| subscription.key)
+            .collect::<Vec<_>>();
+
+        assert_eq!(keys, vec![Key::new("alpha"), Key::new("beta")]);
     }
 
     #[allow(clippy::missing_panics_doc)]
