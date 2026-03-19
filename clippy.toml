@@ -1,8 +1,6 @@
-msrv = "1.85.0"
 check-private-items = true
-check-incompatible-msrv-in-tests = true
 cognitive-complexity-threshold = 20
 too-many-arguments-threshold = 6
 too-many-lines-threshold = 80
 type-complexity-threshold = 200
-doc-valid-idents = ["GPUI", "MSRV"]
+doc-valid-idents = ["GPUI"]

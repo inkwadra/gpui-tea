@@ -3,7 +3,6 @@ name = "gpui_tea"
 version = "0.1.0"
 description = "`gpui_tea` provides the runtime primitives for building TEA-style applications on top of GPUI."
 edition = "2024"
-rust-version = "1.85"
 license = "Apache-2.0"
 readme = "README.md"
 authors = ["Ilya Chernichkin <inkwadra.dev@gmail.com>"]

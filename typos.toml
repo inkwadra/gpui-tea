@@ -13,4 +13,3 @@ gpui = "gpui"
 
 [default.extend-identifiers]
 GPUI = "GPUI"
-MSRV = "MSRV"
