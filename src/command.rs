@@ -283,106 +283,6 @@ impl<Msg: Send + 'static> Command<Msg> {
         )
     }
 
-    /// Run a foreground future on GPUI's foreground executor and dispatch its
-    /// output as a message.
-    ///
-    /// Use this when no [`AsyncApp`] access is needed and the future always
-    /// resolves to a message.
-    pub fn spawn<Fut>(fut: Fut) -> Self
-    where
-        Fut: Future<Output = Msg> + 'static,
-    {
-        Self::effect(Effect::Foreground(Box::new(move |_cx| {
-            async move { Some(fut.await) }.boxed_local()
-        })))
-    }
-
-    /// Run a foreground future as a keyed effect.
-    ///
-    /// This preserves the latest-wins semantics of other keyed commands without
-    /// exposing [`AsyncApp`] to the future body.
-    pub fn spawn_keyed<Fut>(key: impl Into<Key>, fut: Fut) -> Self
-    where
-        Fut: Future<Output = Msg> + 'static,
-    {
-        Self::keyed_effect(
-            key,
-            Effect::Foreground(Box::new(move |_cx| {
-                async move { Some(fut.await) }.boxed_local()
-            })),
-        )
-    }
-
-    /// Run a foreground future that may or may not yield a message.
-    pub fn spawn_opt<Fut>(fut: Fut) -> Self
-    where
-        Fut: Future<Output = Option<Msg>> + 'static,
-    {
-        Self::effect(Effect::Foreground(Box::new(move |_cx| fut.boxed_local())))
-    }
-
-    /// Run an optional foreground future as a keyed command.
-    pub fn spawn_opt_keyed<Fut>(key: impl Into<Key>, fut: Fut) -> Self
-    where
-        Fut: Future<Output = Option<Msg>> + 'static,
-    {
-        Self::keyed_effect(
-            key,
-            Effect::Foreground(Box::new(move |_cx| fut.boxed_local())),
-        )
-    }
-
-    /// Run a background future that does not need [`BackgroundExecutor`].
-    ///
-    /// This is shorthand for [`Command::background`] when the future body does
-    /// not need the executor handle.
-    pub fn background_future<Fut>(fut: Fut) -> Self
-    where
-        Fut: Future<Output = Msg> + Send + 'static,
-    {
-        Self::background(move |_executor| async move { Some(fut.await) })
-    }
-
-    /// Run a keyed background future that does not need [`BackgroundExecutor`].
-    pub fn background_future_keyed<Fut>(key: impl Into<Key>, fut: Fut) -> Self
-    where
-        Fut: Future<Output = Msg> + Send + 'static,
-    {
-        Self::background_keyed(key, move |_executor| async move { Some(fut.await) })
-    }
-
-    /// Run a foreground future for its side effect without using [`AsyncApp`].
-    pub fn perform_future<Fut>(fut: Fut) -> Self
-    where
-        Fut: Future<Output = ()> + 'static,
-    {
-        Self::effect(Effect::Foreground(Box::new(move |_cx| {
-            async move {
-                fut.await;
-                None
-            }
-            .boxed_local()
-        })))
-    }
-
-    /// Run a keyed foreground future for its side effect without using
-    /// [`AsyncApp`].
-    pub fn perform_future_keyed<Fut>(key: impl Into<Key>, fut: Fut) -> Self
-    where
-        Fut: Future<Output = ()> + 'static,
-    {
-        Self::keyed_effect(
-            key,
-            Effect::Foreground(Box::new(move |_cx| {
-                async move {
-                    fut.await;
-                    None
-                }
-                .boxed_local()
-            })),
-        )
-    }
-
     /// Attach a descriptive label used for runtime observability.
     ///
     /// The runtime includes this label in [`crate::RuntimeEvent`] values such as
@@ -513,7 +413,7 @@ impl<Msg: Send + 'static> Default for Command<Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{AsyncApp, TestAppContext};
 
     #[allow(clippy::missing_panics_doc)]
     #[test]
@@ -550,7 +450,11 @@ mod tests {
     async fn mapped_keyed_foreground_command_preserves_label_and_key_and_transforms_message(
         cx: &mut TestAppContext,
     ) {
-        let command = Command::spawn_opt_keyed("load", async { Some(21) })
+        async fn effect(_cx: &mut AsyncApp) -> Option<i32> {
+            Some(21)
+        }
+
+        let command = Command::foreground_keyed("load", effect)
             .label("mapped-load")
             .map(|value| format!("value:{value}"));
 
