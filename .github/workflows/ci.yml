@@ -8,14 +8,14 @@ on:
 
 jobs:
   stable:
-    name: Stable
+    name: Quality Gate
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install stable toolchain
+      - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
@@ -23,27 +23,10 @@ jobs:
       - name: Cache cargo artifacts
         uses: swatinem/rust-cache@v2
 
-      - name: Install typos-cli
+      - name: Install repository tools
         uses: taiki-e/install-action@v2
         with:
-          tool: typos-cli@1.44.0
+          tool: just,typos-cli@1.44.0
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Check compilation
-        run: cargo check --all-targets --all-features
-
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Run typos
-        run: typos
-
-      - name: Build docs
-        run: cargo doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: -D warnings
-
-      - name: Run tests
-        run: cargo test --all-targets --all-features
+      - name: Run quality gate
+        run: just qa
