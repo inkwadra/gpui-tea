@@ -47,6 +47,7 @@ pub(crate) enum CommandInner<Msg> {
     Batch(Vec<Command<Msg>>),
     Effect(Effect<Msg>),
     Keyed { key: Key, effect: Effect<Msg> },
+    Cancel(Key),
 }
 
 /// Identify keyed commands and subscriptions by stable value.
@@ -340,6 +341,15 @@ impl<Msg: Send + 'static> Command<Msg> {
         )
     }
 
+    /// Cancel any currently tracked keyed work for `key`.
+    ///
+    /// Canceling a key removes its tracked task from the runtime. If the
+    /// underlying task still completes later, its completion is ignored as
+    /// stale and does not update the model.
+    pub fn cancel_key(key: impl Into<Key>) -> Self {
+        Self::new(CommandInner::Cancel(key.into()))
+    }
+
     /// Attach a descriptive label used for runtime observability.
     ///
     /// The runtime includes this label in [`crate::RuntimeEvent`] values such as
@@ -430,6 +440,10 @@ impl<Msg: Send + 'static> Command<Msg> {
                 },
                 label,
             },
+            CommandInner::Cancel(key) => Command {
+                inner: CommandInner::Cancel(key),
+                label,
+            },
         }
     }
 
@@ -471,6 +485,10 @@ impl<Msg: Send + 'static> Command<Msg> {
                     key: key.scoped(path),
                     effect,
                 },
+                label,
+            },
+            CommandInner::Cancel(key) => Command {
+                inner: CommandInner::Cancel(key.scoped(path)),
                 label,
             },
         }
@@ -524,19 +542,23 @@ fn command_variant<Msg>(inner: &CommandInner<Msg>) -> &'static str {
         CommandInner::Batch(_) => "Batch",
         CommandInner::Effect(_) => "Effect",
         CommandInner::Keyed { .. } => "Keyed",
+        CommandInner::Cancel(_) => "Cancel",
     }
 }
 
 fn command_execution_kind<Msg>(inner: &CommandInner<Msg>) -> Option<CommandKind> {
     match inner {
         CommandInner::Effect(effect) | CommandInner::Keyed { effect, .. } => Some(effect.kind()),
-        CommandInner::None | CommandInner::Emit(_) | CommandInner::Batch(_) => None,
+        CommandInner::None
+        | CommandInner::Emit(_)
+        | CommandInner::Batch(_)
+        | CommandInner::Cancel(_) => None,
     }
 }
 
 fn command_key<Msg>(inner: &CommandInner<Msg>) -> Option<&Key> {
     match inner {
-        CommandInner::Keyed { key, .. } => Some(key),
+        CommandInner::Keyed { key, .. } | CommandInner::Cancel(key) => Some(key),
         CommandInner::None
         | CommandInner::Emit(_)
         | CommandInner::Batch(_)
@@ -623,6 +645,7 @@ mod tests {
             CommandInner::Batch(_) => "batch",
             CommandInner::Effect(_) => "effect",
             CommandInner::Keyed { .. } => "keyed",
+            CommandInner::Cancel(_) => "cancel",
         }
     }
 }
