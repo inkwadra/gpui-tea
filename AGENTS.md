@@ -1,49 +1,46 @@
-# Repository Guidelines
+# gpui-tea Project Instructions
 
-## Project Structure & Module Organization
-`gpui-tea` is a Rust library crate. Core runtime code lives in `src/`:
-`command.rs`, `dispatcher.rs`, `program.rs`, `runtime.rs`, `subscription.rs`,
-`view.rs`, and `observability.rs`. Public exports are wired through
-`src/lib.rs`, which also carries crate-level docs and examples.
+This file provides context and instructions for AI agents working in this repository.
 
-Integration tests live in `tests/`, with runtime contract coverage in
-`tests/runtime_contracts.rs`. Runnable examples live in `examples/`
-(`counter.rs`, `subscriptions.rs`, `observability.rs`, etc.) and should stay
-aligned with the public API. Repository tooling is defined in `Justfile`,
-`rustfmt.toml`, `clippy.toml`, and `.github/workflows/ci.yml`.
+## Project Overview
 
-## Build, Test, and Development Commands
-Use the stable toolchain from `rust-toolchain.toml`.
+`gpui-tea` is a Rust workspace that provides runtime primitives for building Elm-style (The Elm Architecture) applications on top of the `gpui` framework (by Zed). It enables composable models, commands, and subscriptions.
 
-- `just fmt`: format the workspace with `rustfmt`.
-- `just fmt-check`: verify formatting without editing files.
-- `just check`: compile all targets and features.
-- `just clippy`: run Clippy with `-D warnings`.
-- `just test`: run unit, integration, and example-adjacent test targets.
-- `just doc`: build docs with `RUSTDOCFLAGS="-D warnings"`.
-- `just qa`: run the full pre-push gate used by CI.
-- `cargo run --example counter`: run a specific example locally.
+Key features and concepts include:
+- **`Model`**: Defines state transitions and rendering.
+- **`Program`**: Used for mounting and running a model inside GPUI.
+- **`Command`**: Handles immediate, foreground, and background effects.
+- **`Subscription` & `Subscriptions`**: Manages long-lived external event sources.
+- **Nested Models**: Features like `ModelContext` and `ChildScope` support nesting child models under explicit paths.
+- **Observability**: Built-in support for telemetry and tracing.
+- **Workspace Crates**:
+  - `crates/gpui_tea`: The main library containing the runtime and core concepts.
+  - `crates/gpui_tea_macros`: Procedural macros, such as `Composite`.
 
-## Coding Style & Naming Conventions
-Follow idiomatic Rust 2024 with default `rustfmt` formatting (`style_edition =
-"2024"`). Use snake_case for modules, files, and functions; PascalCase for
-types and traits; SCREAMING_SNAKE_CASE for constants. Keep public APIs and
-module names explicit and domain-focused. The crate forbids `unsafe` and warns
-on missing docs, so document public items and avoid hidden behavior.
+## Building, Running, and Testing
 
-## Testing Guidelines
-Prefer deterministic tests that exercise observable runtime behavior. GPUI
-integration tests use `#[gpui::test]`; keep new coverage in `tests/` unless it
-is tightly scoped to a private module. Name tests by behavior, for example
-`dispatcher_preserves_fifo_delivery_for_enqueued_messages`. Run `just test`
-before opening a PR and `just qa` before merging substantial changes.
+The project uses `just` as its command runner.
 
-## Commit & Pull Request Guidelines
-Recent history follows Conventional Commit style with optional scopes and
-breaking markers, for example `feat(view)!: ...`, `refactor(command)!: ...`,
-and `docs(readme): ...`. Keep commit subjects imperative and specific.
+Local tooling prerequisites for the documented workflow:
+- `just`
+- `typos`
+- Rust `stable` with `clippy` and `rustfmt` components
 
-PRs should explain the behavior change, note any API or runtime-contract impact,
-link related issues, and include updated tests or examples when applicable. For
-user-visible example or documentation changes, include the exact command you
-used to validate them.
+Key development commands:
+- `just fmt`: Format the workspace.
+- `just fmt-check`: Verify formatting without changes.
+- `just check`: Compile all targets and features.
+- `just clippy`: Run Clippy with warnings denied.
+- `just typos`: Run the typo checker.
+- `just lint`: Run Clippy and typos.
+- `just test`: Run the full test suite.
+- `just doc`: Build docs with rustdoc warnings denied.
+- `just qa`: Run the full pre-push quality gate (formats, checks, lints, docs, and tests).
+- `just fix`: Apply local formatting and Clippy fixes.
+
+## Development Conventions
+
+- **Strict Lints**: The workspace enforces strict rustc and clippy lints (`unsafe_code` is forbidden, missing docs trigger warnings).
+- **Quality Gates**: Always run `just qa` before submitting or committing changes to ensure formatting, typing, clippy, doc generation, and tests all pass.
+- **Testing**: Tests are located within the `tests/` directories or in inline `#[cfg(test)]` modules. Ensure that tests are updated or added for any new functionality.
+- **Documentation**: All public APIs must be documented. Run `just doc` to ensure no warnings are present.

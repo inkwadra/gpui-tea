@@ -1,102 +1,139 @@
-# gpui-tea
+# gpui_tea
 
 [![CI](https://github.com/inkwadra/gpui-tea/actions/workflows/ci.yml/badge.svg)](https://github.com/inkwadra/gpui-tea/actions/workflows/ci.yml) [![Crates.io](https://img.shields.io/crates/v/gpui_tea.svg)](https://crates.io/crates/gpui_tea) [![docs.rs](https://img.shields.io/docsrs/gpui_tea)](https://docs.rs/gpui_tea) [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 > [!WARNING]
 > The public API is intended to be stable for real use, but future releases may still refine interfaces or introduce compatibility-affecting changes where needed.
 
-`gpui_tea` provides the runtime primitives for building TEA-style applications on top of GPUI.
+TEA-style runtime primitives for Rust developers building desktop applications with GPUI.
 
-The crate defines a `Model`-driven update loop, declarative `Command` and
-`Subscription` types, and a `Program` runtime that coordinates message
-delivery, queue draining, async effect execution, keyed task replacement, and
-subscription reconciliation.
+`gpui_tea` is a Rust library for building Elm Architecture applications on top of
+[GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui). You use it when you want a
+mounted program with explicit state transitions, message-driven updates, and rendering that stays
+inside GPUI's application model.
 
-The design stays intentionally GPUI-first. Models continue to work directly
-with GPUI's `App`, views return `gpui_tea::View` as a thin wrapper around
-ordinary GPUI elements, and mounted programs remain standard GPUI entities
-rather than being wrapped in a separate UI abstraction.
-
-This makes the crate suitable for applications that want explicit state
-transitions, controlled follow-up work, and long-lived external event sources,
-while preserving direct access to GPUI's rendering and application model.
+The crate is aimed at developers building desktop user interfaces with GPUI who want a structured
+way to express initialization, synchronous updates, asynchronous effects, and long-lived event
+sources. The public surface centers on `Model`, `Program`, `Command`, and `Subscription`, with
+support for nested models through `ChildScope` and the `Composite` derive macro.
 
 ## Table of Contents
 
 - [Features](#features)
 - [Requirements](#requirements)
 - [Installation](#installation)
+- [Configuration](#configuration)
 - [Usage](#usage)
-- [Core Concepts](#core-concepts)
-- [Nested Models](#nested-models)
-- [Runtime Guarantees](#runtime-guarantees)
-- [Observability](#observability)
-- [Development](#development)
+- [API Reference](#api-reference)
+- [Examples](#examples)
 - [License](#license)
 
 ## Features
 
-- Explicit message handling through `Model::update`
-- FIFO queue processing with enqueue-only dispatch
-- Non-reentrant updates, even when handlers emit more messages
-- Keyed commands with latest-wins completion semantics
-- Declarative subscriptions keyed by stable identity
-- Runtime hooks for queue, command, effect, and subscription lifecycle events
-- Structured telemetry envelopes for tracing and metrics adapters
-- Configurable queue policies and read-only runtime snapshots
+- TEA-style runtime for GPUI with a `Model` trait that separates `init`, `update`, `view`, and
+  `subscriptions`.
+- Command system for immediate messages, foreground effects, background effects, batching, and
+  keyed latest-wins work whose stale completions are ignored.
+- Declarative subscriptions that are retained, rebuilt, or removed by stable `Key` values.
+- Nested model support through `ModelContext`, `ChildScope`, and `#[derive(Composite)]`.
+- Runtime observability through `ProgramConfig`, `RuntimeEvent`, and `TelemetryEvent`, with
+  optional adapters for `tracing` and `metrics`.
 
 ## Requirements
 
-- Stable Rust toolchain
-- `clippy` and `rustfmt` are included in the repository toolchain configuration
-- GPUI has platform-specific system requirements; follow the upstream
-  [`gpui` documentation](https://docs.rs/gpui/latest/gpui/) for environment setup details
+- Rust stable toolchain. The repository pins the `stable` channel in `rust-toolchain.toml`.
+- A Cargo toolchain that supports Rust 2024 edition crates. The manifest does not declare a
+  separate `rust-version`.
+- For local development in this repository: `clippy`, `rustfmt`, and `typos`.
+- For running the interactive examples: a desktop environment capable of opening GPUI windows.
+
+The repository does not document additional external services such as databases, brokers, or
+servers.
 
 ## Installation
 
-Install the published crate from `crates.io`:
-
-```toml
-[dependencies]
-gpui_tea = "0.1.0"
-```
-
-If you prefer `cargo add`:
+Add the crate from crates.io:
 
 ```bash
 cargo add gpui_tea
 ```
 
-Use a Git dependency when you want unreleased changes from the repository:
+Enable optional telemetry integrations as needed:
+
+```bash
+cargo add gpui_tea --features tracing
+cargo add gpui_tea --features metrics
+```
+
+To depend on the current repository state instead of a crates.io release, use a Git dependency:
 
 ```toml
 [dependencies]
 gpui_tea = { git = "https://github.com/inkwadra/gpui-tea" }
 ```
 
-The crate name is `gpui_tea` in code and dependency declarations.
+To build the workspace test suite from source:
+
+```bash
+git clone https://github.com/inkwadra/gpui-tea
+cd gpui-tea
+cargo test --workspace --all-targets --all-features
+```
+
+To run the repository's full validation gate, use:
+
+```bash
+just qa
+```
+
+## Configuration
+
+`gpui_tea` does not use configuration files or required environment variables for normal library
+use.
+
+### Cargo Features
+
+| Feature | Default | Description |
+| --- | --- | --- |
+| `metrics` | No | Enables `observe_metrics_telemetry`. |
+| `tracing` | No | Enables `observe_tracing_telemetry` and the `telemetry` example. |
+
+### Runtime Configuration
+
+Use `ProgramConfig` when you need queue controls or observability hooks:
+
+- `queue_policy(QueuePolicy)` selects unbounded, reject-new, drop-newest, or drop-oldest
+  backpressure behavior. Under drop policies, `dispatch()` may still return `Ok(())` even when a
+  message is discarded or an older queued message is displaced.
+- `queue_warning_threshold(usize)` emits queue warning events whenever the current queue depth is
+  greater than the threshold.
+- `observer(...)` receives high-level `RuntimeEvent` values.
+- `telemetry_observer(...)` receives structured `TelemetryEnvelope` values.
+- `describe_message(...)`, `describe_key(...)`, and `describe_program(...)` attach readable
+  descriptions to observability output.
+
+The only environment variable referenced in repository examples is `RUST_LOG=debug`, which is used
+when running the `telemetry` example.
 
 ## Usage
 
-The snippets below show the shape of the API. Each scenario has a corresponding
-runnable program in [`examples/`](examples) that keeps the full GPUI setup and
-UI code out of the README.
+The usual flow is:
 
-`View` is the render boundary for `Model::view`. It stays GPUI-first by
-accepting any GPUI `IntoElement`, and `.into_view()` is the default ergonomic
-conversion in user code.
+1. Define a message enum for your model.
+2. Implement `Model` for your state type.
+3. Return `Command` values from `init` or `update` for follow-up work.
+4. Mount the model with `Program::mount(...)` or `ModelExt::into_program(...)`.
 
-### Minimal program
-
-Start with a `Model` that owns state, updates in response to messages, renders
-GPUI elements, and mounts through `Program::mount`.
+The smallest working shape looks like this:
 
 ```rust
-use gpui::{App, ParentElement, Window, div};
-use gpui_tea::{Command, Dispatcher, IntoView, Model, View};
+use gpui::{App, Application, Bounds, Window, WindowBounds, WindowOptions, div, px, size};
+use gpui::prelude::*;
+use gpui_tea::{Command, Dispatcher, IntoView, Model, ModelContext, Program, View};
 
+#[derive(Clone, Copy)]
 enum Msg {
-    Increment,
+    Loaded,
 }
 
 struct Counter {
@@ -106,195 +143,9 @@ struct Counter {
 impl Model for Counter {
     type Msg = Msg;
 
-    fn update(&mut self, msg: Self::Msg, _cx: &mut App) -> Command<Self::Msg> {
-        match msg {
-            Msg::Increment => self.value += 1,
-        }
-
-        Command::none()
+    fn init(&mut self, _cx: &mut App, _scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+        Command::emit(Msg::Loaded)
     }
-
-    fn view(
-        &self,
-        _window: &mut Window,
-        _cx: &mut App,
-        _dispatcher: &Dispatcher<Self::Msg>,
-    ) -> View {
-        div().child(self.value.to_string()).into_view()
-    }
-}
-```
-
-Run it: [`examples/counter.rs`](examples/counter.rs) with `cargo run --example counter`
-
-### Initialize with an initial command
-
-Use `Model::init` when the mounted program should schedule work before handling
-normal user-driven messages.
-
-```rust
-use gpui::{App, Window, div};
-use gpui_tea::{Command, Dispatcher, IntoView, Model, View};
-
-enum Msg {
-    BootstrapLoaded,
-}
-
-struct BootstrappedCounter;
-
-impl Model for BootstrappedCounter {
-    type Msg = Msg;
-
-    fn init(&mut self, _cx: &mut App) -> Command<Self::Msg> {
-        Command::emit(Msg::BootstrapLoaded).label("bootstrap")
-    }
-
-    fn update(&mut self, _msg: Self::Msg, _cx: &mut App) -> Command<Self::Msg> {
-        Command::none()
-    }
-
-    fn view(
-        &self,
-        _window: &mut Window,
-        _cx: &mut App,
-        _dispatcher: &Dispatcher<Self::Msg>,
-    ) -> View {
-        div().into_view()
-    }
-}
-```
-
-Run it: [`examples/init_command.rs`](examples/init_command.rs) with `cargo run --example init_command`
-
-### Run keyed async work
-
-Use keyed commands when later work should become authoritative for the same
-logical operation. Earlier completions on the same key are ignored as stale.
-
-```rust
-use gpui::{App, Window, div};
-use gpui_tea::{Command, Dispatcher, IntoView, Model, View};
-use std::time::Duration;
-
-enum Msg {
-    Run,
-    Loaded(&'static str),
-}
-
-struct Demo;
-
-impl Model for Demo {
-    type Msg = Msg;
-
-    fn update(&mut self, msg: Self::Msg, _cx: &mut App) -> Command<Self::Msg> {
-        match msg {
-            Msg::Run => Command::batch([
-                Command::background_keyed("load", |_| async move {
-                    std::thread::sleep(Duration::from_millis(800));
-                    Some(Msg::Loaded("slow"))
-                }),
-                Command::background_keyed("load", |_| async move {
-                    std::thread::sleep(Duration::from_millis(150));
-                    Some(Msg::Loaded("fast"))
-                }),
-            ]),
-            Msg::Loaded(_) => Command::none(),
-        }
-    }
-
-    fn view(
-        &self,
-        _window: &mut Window,
-        _cx: &mut App,
-        _dispatcher: &Dispatcher<Self::Msg>,
-    ) -> View {
-        div().into_view()
-    }
-}
-```
-
-Run it: [`examples/keyed_effect.rs`](examples/keyed_effect.rs) with `cargo run --example keyed_effect`
-
-### Declare subscriptions
-
-Use `Subscription` values to declare long-lived external inputs by stable key.
-Reusing a key retains the existing handle; changing it rebuilds the
-subscription.
-
-```rust
-use gpui::{App, Window, div};
-use gpui_tea::{
-    Command, Dispatcher, IntoView, Model, SubHandle, Subscription, Subscriptions, View,
-};
-
-enum Msg {
-    FromSubscription(&'static str),
-}
-
-struct Demo {
-    active_key: Option<&'static str>,
-}
-
-impl Model for Demo {
-    type Msg = Msg;
-
-    fn update(&mut self, _msg: Self::Msg, _cx: &mut App) -> Command<Self::Msg> {
-        Command::none()
-    }
-
-    fn subscriptions(&self, _cx: &mut App) -> Subscriptions<Self::Msg> {
-        let Some(key) = self.active_key else {
-            return Subscriptions::none();
-        };
-
-        Subscriptions::one(Subscription::new(key, move |cx| {
-            cx.dispatch(Msg::FromSubscription(key))
-                .expect("the mounted program is alive while the subscription is being built");
-            SubHandle::None
-        }))
-    }
-
-    fn view(
-        &self,
-        _window: &mut Window,
-        _cx: &mut App,
-        _dispatcher: &Dispatcher<Self::Msg>,
-    ) -> View {
-        div().into_view()
-    }
-}
-```
-
-Run it: [`examples/subscriptions.rs`](examples/subscriptions.rs) with `cargo run --example subscriptions`
-
-## Nested Models
-
-Use `NestedModel` together with `ModelContext::scope` when a parent model owns
-child state and wants child commands, subscriptions, and dispatch to stay
-namespaced by explicit path.
-
-```rust
-use gpui::{App, Window, div};
-use gpui_tea::{
-    Command, Dispatcher, IntoView, ModelContext, NestedModel, View,
-};
-
-#[derive(Clone, Copy)]
-enum ChildMsg {
-    Increment,
-}
-
-#[derive(Clone, Copy)]
-enum Msg {
-    Sidebar(ChildMsg),
-}
-
-struct Child {
-    value: i32,
-}
-
-impl NestedModel for Child {
-    type Msg = ChildMsg;
 
     fn update(
         &mut self,
@@ -303,7 +154,7 @@ impl NestedModel for Child {
         _scope: &ModelContext<Self::Msg>,
     ) -> Command<Self::Msg> {
         match msg {
-            ChildMsg::Increment => self.value += 1,
+            Msg::Loaded => self.value = 1,
         }
 
         Command::none()
@@ -316,29 +167,57 @@ impl NestedModel for Child {
         _scope: &ModelContext<Self::Msg>,
         _dispatcher: &Dispatcher<Self::Msg>,
     ) -> View {
-        div().child(self.value.to_string()).into_view()
+        div().child(format!("count: {}", self.value)).into_view()
     }
 }
 
-struct Parent {
-    sidebar: Child,
-}
+fn main() {
+    Application::new().run(|cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(640.0), px(480.0)), cx);
 
-impl NestedModel for Parent {
-    type Msg = Msg;
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            |_, cx| Program::mount(Counter { value: 0 }, cx),
+        )
+        .unwrap();
+
+        cx.activate(true);
+    });
+}
+```
+
+### Common Patterns
+
+- Bootstrap state with `Model::init()` and return `Command::emit(...)` or an async command.
+- Schedule asynchronous work with `Command::foreground(...)` or `Command::background(...)`.
+- Replace in-flight work by key with `Command::foreground_keyed(...)` or
+  `Command::background_keyed(...)`. Older tasks may still finish, but the runtime ignores stale
+  completions.
+- Cancel tracked keyed work with `Command::cancel_key(...)`.
+- Declare long-lived external event sources in `subscriptions()` with `Subscription::new(...)`.
+- Compose child models with `ModelContext::scope(...)` or `#[derive(Composite)]`.
+
+## API Reference
+
+### `Model`
+
+Signature:
+
+```rust
+pub trait Model: Sized + 'static {
+    type Msg: Send + 'static;
+
+    fn init(&mut self, cx: &mut App, scope: &ModelContext<Self::Msg>) -> Command<Self::Msg>;
 
     fn update(
         &mut self,
         msg: Self::Msg,
         cx: &mut App,
         scope: &ModelContext<Self::Msg>,
-    ) -> Command<Self::Msg> {
-        match msg {
-            Msg::Sidebar(child_msg) => scope
-                .scope("sidebar", Msg::Sidebar)
-                .update(&mut self.sidebar, child_msg, cx),
-        }
-    }
+    ) -> Command<Self::Msg>;
 
     fn view(
         &self,
@@ -346,137 +225,180 @@ impl NestedModel for Parent {
         cx: &mut App,
         scope: &ModelContext<Self::Msg>,
         dispatcher: &Dispatcher<Self::Msg>,
-    ) -> View {
-        scope
-            .scope("sidebar", Msg::Sidebar)
-            .view(&self.sidebar, window, cx, dispatcher)
-    }
+    ) -> View;
+
+    fn subscriptions(
+        &self,
+        cx: &mut App,
+        scope: &ModelContext<Self::Msg>,
+    ) -> Subscriptions<Self::Msg>;
 }
 ```
 
-Run it: [`examples/nested_models.rs`](examples/nested_models.rs) with `cargo run --example nested_models`
+- Parameters: `msg` is your domain message, `cx` is the GPUI application context, `scope`
+  contains the current child path, and `dispatcher` sends messages back into the mounted program.
+- Return type: `Command<Self::Msg>` from `init` and `update`, `View` from `view`,
+  `Subscriptions<Self::Msg>` from `subscriptions`.
 
-### Observe runtime activity
-
-Use `ProgramConfig` when the mounted program should emit runtime-level events
-for dispatch, queue, effect, and subscription activity.
+Example:
 
 ```rust
-use gpui::App;
-use gpui_tea::{Program, ProgramConfig, RuntimeEvent};
-
-enum Msg {
-    Run,
+fn init(&mut self, _cx: &mut App, _scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+    Command::emit(()).label("bootstrap")
 }
-
-let config = ProgramConfig::new()
-    .describe_message(|_msg: &Msg| "run")
-    .describe_key(|key| format!("{key:?}"))
-    .observer(|event| {
-        if let RuntimeEvent::EffectCompleted { label, .. } = event {
-            eprintln!("completed: {}", label.unwrap_or("<none>"));
-        }
-    });
-
-// Pass config to Program::mount_with(model, config, cx).
 ```
 
-Run it: [`examples/observability.rs`](examples/observability.rs) with `cargo run --example observability`
+### `Program::mount` And `Program::mount_with`
 
-For the complete public API surface, published documentation lives on
-[`docs.rs`](https://docs.rs/gpui_tea).
+Signatures:
 
-## Core Concepts
+```rust
+pub fn mount(model: M, cx: &mut App) -> Entity<Program<M>>;
+pub fn mount_with(model: M, config: ProgramConfig<M::Msg>, cx: &mut App) -> Entity<Program<M>>;
+```
 
-- `Msg`
-  The application protocol shared by `Model::update`, `Dispatcher::dispatch`, commands, and subscriptions.
-- `Model`
-  Defines the state transition contract. `init` returns the initial `Command`, `update` handles one message,
-  `view` renders GPUI elements, and `subscriptions` declares the active subscription set for the current state.
-- `Program`
-  Hosts one mounted `Model` inside a GPUI entity and owns the runtime for that program instance.
-- `Dispatcher`
-  An enqueue-only handle for sending messages back into a mounted program. Cloning it is cheap and intended for UI
-  event handlers and subscription builders.
-- `Command`
-  Describes follow-up work after a state transition. Use it for immediate emits, foreground effects, background
-  effects, keyed work, and ordered batches.
-- `Subscription` and `Subscriptions`
-  Declare long-lived external inputs with stable keys. The declared set is reconciled against the active runtime
-  state after initialization and after queue drains that process messages.
-- `Key`
-  The stable identity used by keyed commands and subscriptions. Key reuse is what gives keyed effects and
-  subscriptions their lifecycle semantics.
-- `ProgramConfig`
-  Configure runtime instrumentation before mounting a program, including observer callbacks, telemetry
-  observers, queue policies, queue warning thresholds, and message/key/program formatters for emitted events.
-- `RuntimeSnapshot`
-  A read-only summary of queue depth, drain status, active keyed tasks, and active subscriptions for a mounted program.
+- Parameters: `model` is the initial state, `config` customizes queue and observability behavior,
+  and `cx` is the GPUI application context.
+- Behavior: mounting immediately calls `Model::init()`, executes its returned command, and performs
+  the initial subscription reconciliation before returning.
+- Return type: `Entity<Program<M>>`.
 
-## Runtime Guarantees
+Example:
 
-- `Program::mount` and `Program::mount_with` create the runtime, call `Model::init` once, execute the initial
-  command, and reconcile the initial subscription set
-- `Dispatcher::dispatch` is enqueue-only and never re-enters `Model::update` inline
-- The runtime drains its internal message queue in FIFO order
-- Messages dispatched while a queue drain is already in progress are appended and processed later instead of
-  recursively re-entering `Model::update`
-- The internal message queue is intentionally unbounded
-- A newer keyed command replaces the previously tracked task for the same key and makes that newer work
-  authoritative
-- Replacing a keyed command releases the previously tracked task handle; if older keyed work still completes after
-  being replaced, its completion is treated as stale and does not enqueue a message
-- Subscription identity is key-based; reusing a key retains the existing handle, and changing or removing the key
-  rebuilds or drops the subscription during reconciliation
-- Dispatching after a program is released fails with `Error::ProgramUnavailable`
+```rust
+let config = ProgramConfig::<Msg>::new().queue_warning_threshold(32);
+let entity = Program::mount_with(Counter { value: 0 }, config, cx);
+```
 
-These guarantees are enforced by the repository's runtime contract tests in
-[`tests/runtime_contracts.rs`](tests/runtime_contracts.rs).
+### `Command`
 
-## Observability
+Representative constructors:
 
-`ProgramConfig` lets you observe runtime activity synchronously through an observer callback. The runtime can emit
-events for dispatch acceptance and rejection, queue drain boundaries, queue growth warnings, command scheduling,
-keyed replacement, effect completion, stale keyed completions, and subscription lifecycle changes.
+```rust
+pub fn none() -> Command<Msg>;
+pub fn emit(message: Msg) -> Command<Msg>;
+pub fn batch(commands: impl IntoIterator<Item = Command<Msg>>) -> Command<Msg>;
+pub fn foreground<AsyncFn>(effect: AsyncFn) -> Command<Msg>;
+pub fn background<F, Fut>(effect: F) -> Command<Msg>;
+pub fn foreground_keyed<AsyncFn>(key: impl Into<Key>, effect: AsyncFn) -> Command<Msg>;
+pub fn background_keyed<F, Fut>(key: impl Into<Key>, effect: F) -> Command<Msg>;
+pub fn cancel_key(key: impl Into<Key>) -> Command<Msg>;
+pub fn map<F, NewMsg>(self, f: F) -> Command<NewMsg>;
+```
 
-Use `ProgramConfig::describe_message` when event payloads should include a human-readable message description, and
-use `ProgramConfig::describe_key` when keyed commands or subscriptions should report stable identifiers in a more
-meaningful form.
+- Parameters: commands take either a concrete message, an async effect closure, or a stable `Key`
+  used for deduplication and cancellation.
+- Keyed commands are latest-wins: scheduling a newer keyed command replaces the tracked task for
+  that key, and any later completion from the older task is ignored rather than aborted.
+- Return type: `Command<Msg>` or `Command<NewMsg>` for `map`.
 
-Use `Command::label` and `Subscription::label` when you need event streams to carry names for specific effects or
-subscription builders. Labels become visible in runtime events such as `CommandScheduled`, `EffectCompleted`,
-`SubscriptionBuilt`, `SubscriptionRetained`, and `SubscriptionRemoved`.
+Example:
 
-`ProgramConfig::telemetry_observer` emits `TelemetryEnvelope` values with `ProgramId`, monotonic `event_id`,
-`emitted_at`, and `queue_depth` metadata. The recommended production path is to keep callbacks cheap and wire
-structured telemetry into optional adapters such as `observe_tracing_telemetry` or `observe_metrics_telemetry`.
+```rust
+Command::background_keyed("load-profile", |_| async move {
+    Some(())
+})
+.label("profile-load")
+```
 
-Queue controls are configured through `ProgramConfig::queue_policy`. `QueuePolicy::Unbounded` preserves the
-existing behavior. `RejectNew`, `DropNewest`, and `DropOldest` let applications trade throughput for bounded
-memory without changing GPUI lifecycle semantics.
+### `Subscription` And `Subscriptions`
 
-## Development
+Signatures:
 
-The repository keeps its local and CI workflow centered on [`Justfile`](Justfile).
-For a full pre-push validation pass:
+```rust
+pub fn new<F>(key: impl Into<Key>, builder: F) -> Subscription<Msg>;
+pub fn one(subscription: Subscription<Msg>) -> Subscriptions<Msg>;
+pub fn batch(
+    subscriptions: impl IntoIterator<Item = Subscription<Msg>>,
+) -> Result<Subscriptions<Msg>>;
+```
+
+- Parameters: `key` is stable subscription identity, and `builder` receives a
+  `SubscriptionContext<'_, Msg>` with access to `App` and the program `Dispatcher`.
+- Constraint: keys must be unique within a `Subscriptions` set. `Subscriptions::batch(...)` and
+  `push(...)` return `Error::DuplicateSubscriptionKey` when duplicates are declared.
+- Return type: `Subscription<Msg>` or `Subscriptions<Msg>`.
+
+Example:
+
+```rust
+Subscriptions::<()>::one(
+    Subscription::new("clock", |cx| {
+        cx.dispatch(()).expect("program should be mounted");
+        gpui_tea::SubHandle::None
+    })
+    .label("clock-subscription"),
+)
+```
+
+### `#[derive(Composite)]`
+
+Syntax:
+
+```rust
+#[derive(Composite)]
+#[composite(message = ParentMsg)]
+struct Parent {
+    #[child(path = "sidebar", lift = ParentMsg::Sidebar, extract = ParentMsg::into_sidebar)]
+    sidebar: SidebarModel,
+}
+```
+
+- Parameters: `message` declares the parent message type; each `child` attribute defines the child
+  path, the lift function, and the extractor used to route parent messages back to the child.
+- Generated helpers: the macro adds hidden aggregate methods `__composite_init`,
+  `__composite_update`, and `__composite_subscriptions`, plus one hidden `<field>_view` helper per
+  child field.
+- Caveat: child subscriptions must still resolve to unique scoped keys. The generated composite
+  subscription helper panics if two child subscriptions collide after scoping.
+
+Example:
+
+```rust
+fn init(&mut self, cx: &mut App, scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+    self.__composite_init(cx, scope)
+}
+```
+
+## Examples
+
+Run the packaged examples from the workspace root:
 
 ```bash
+cargo run -p gpui_tea --example counter
+cargo run -p gpui_tea --example init_command
+cargo run -p gpui_tea --example keyed_effect
+cargo run -p gpui_tea --example nested_models
+cargo run -p gpui_tea --example subscriptions
+cargo run -p gpui_tea --example observability
+RUST_LOG=debug cargo run -p gpui_tea --example telemetry --features tracing
+```
+
+Each example focuses on one runtime behavior:
+
+- `counter`: minimal mounted program and message dispatch from the view.
+- `init_command`: bootstrap work triggered by `Model::init()`.
+- `keyed_effect`: latest-wins async work on a stable key.
+- `nested_models`: `Composite` composition and child path scoping.
+- `subscriptions`: declarative subscription reconciliation by key.
+- `observability`: `RuntimeEvent` hooks with readable labels.
+- `telemetry`: structured tracing output for queue activity, keyed replacement, and cancellation.
+
+For repository development, the `Justfile` mirrors CI:
+
+```bash
+just fmt
+just fmt-check
+just check
+just clippy
+just lint
+just typos
+just doc
+just test
 just qa
+just fix
 ```
-
-`just qa` runs the same core gates the project expects to stay green:
-
-```bash
-cargo fmt --all --check
-cargo check --all-targets --all-features
-cargo clippy --all-targets --all-features -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-cargo test --all-targets --all-features
-typos
-```
-
-Use `just help` to inspect the rest of the local recipes.
 
 ## License
 
-Licensed under Apache-2.0. See [`LICENSE`](LICENSE).
+Licensed under [Apache-2.0](LICENSE).
