@@ -5,6 +5,8 @@ default: help
 help:
     @printf '%s\n' \
       'Available recipes:' \
+      '  just metadata       - validate workspace metadata resolution' \
+      '  just package        - inspect packaged file sets for publishable crates' \
       '  just fmt            - format the workspace' \
       '  just fmt-check      - verify formatting without changes' \
       '  just check          - compile all targets and features' \
@@ -16,6 +18,13 @@ help:
       '  just qa             - run the full pre-push quality gate' \
       '  just fix            - apply local formatting and Clippy fixes'
 
+metadata:
+    cargo metadata --no-deps --format-version 1 > /dev/null
+
+package:
+    cargo package -p gpui_tea --allow-dirty --list > /dev/null
+    cargo package -p gpui_tea_macros --allow-dirty --list > /dev/null
+
 fmt:
     cargo fmt --all
 
@@ -23,16 +32,16 @@ fmt-check:
     cargo fmt --all --check
 
 check:
-    cargo check --all-targets --all-features
+    cargo check --workspace --all-targets --all-features
 
 clippy:
-    cargo clippy --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D clippy::cargo -A clippy::multiple-crate-versions
 
 doc:
-    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 
 test:
-    cargo test --all-targets --all-features
+    cargo test --workspace --all-targets --all-features
 
 typos:
     typos
@@ -42,6 +51,7 @@ lint:
     just typos
 
 qa:
+    just metadata
     just fmt-check
     just check
     just lint
@@ -50,7 +60,7 @@ qa:
 
 fix:
     cargo fmt --all
-    cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged -- -D warnings
+    cargo clippy --workspace --fix --all-targets --all-features --allow-dirty --allow-staged -- -D warnings
 
 clean:
     cargo clean

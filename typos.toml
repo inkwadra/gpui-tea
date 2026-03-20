@@ -1,6 +1,6 @@
 [files]
 ignore-hidden = false
-extend-exclude = [".git/", "target/", "Cargo.lock"]
+extend-exclude = [".git/", "target/", "Cargo.lock", ".cargo/", "*.crate"]
 
 [default]
 locale = "en-us"

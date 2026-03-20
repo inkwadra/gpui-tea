@@ -8,6 +8,7 @@
 *.sh text eol=lf
 *.svg text eol=lf
 *.lock text eol=lf
+Justfile text eol=lf
 
 *.bat text eol=crlf
 *.cmd text eol=crlf
@@ -36,4 +37,4 @@
 *.xz binary
 *.7z binary
 
-Cargo.lock linguist-generated merge=binary
+Cargo.lock linguist-generated

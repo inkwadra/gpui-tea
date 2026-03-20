@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
+/*.crate
 
 # Coverage and profiling outputs
 /coverage/
@@ -11,6 +12,7 @@ tarpaulin-report.html
 # Local Cargo credentials should never be committed
 /.cargo/credentials
 /.cargo/credentials.toml
+/.cargo/.package-cache
 
 # Editor swap and backup files
 **/*.bk
@@ -22,6 +24,7 @@ tarpaulin-report.html
 .idea/
 .vscode/
 .direnv/
+.envrc
 
 # OS-generated files
 .DS_Store
