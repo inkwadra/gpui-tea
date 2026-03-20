@@ -28,6 +28,7 @@ while preserving direct access to GPUI's rendering and application model.
 - [Installation](#installation)
 - [Usage](#usage)
 - [Core Concepts](#core-concepts)
+- [Nested Models](#nested-models)
 - [Runtime Guarantees](#runtime-guarantees)
 - [Observability](#observability)
 - [Development](#development)
@@ -245,7 +246,8 @@ impl Model for Demo {
         };
 
         Subscriptions::one(Subscription::new(key, move |cx| {
-            cx.dispatch(Msg::FromSubscription(key)).unwrap();
+            cx.dispatch(Msg::FromSubscription(key))
+                .expect("the mounted program is alive while the subscription is being built");
             SubHandle::None
         }))
     }
@@ -262,6 +264,95 @@ impl Model for Demo {
 ```
 
 Run it: [`examples/subscriptions.rs`](examples/subscriptions.rs) with `cargo run --example subscriptions`
+
+## Nested Models
+
+Use `NestedModel` together with `ModelContext::scope` when a parent model owns
+child state and wants child commands, subscriptions, and dispatch to stay
+namespaced by explicit path.
+
+```rust
+use gpui::{App, Window, div};
+use gpui_tea::{
+    Command, Dispatcher, IntoView, ModelContext, NestedModel, View,
+};
+
+#[derive(Clone, Copy)]
+enum ChildMsg {
+    Increment,
+}
+
+#[derive(Clone, Copy)]
+enum Msg {
+    Sidebar(ChildMsg),
+}
+
+struct Child {
+    value: i32,
+}
+
+impl NestedModel for Child {
+    type Msg = ChildMsg;
+
+    fn update(
+        &mut self,
+        msg: Self::Msg,
+        _cx: &mut App,
+        _scope: &ModelContext<Self::Msg>,
+    ) -> Command<Self::Msg> {
+        match msg {
+            ChildMsg::Increment => self.value += 1,
+        }
+
+        Command::none()
+    }
+
+    fn view(
+        &self,
+        _window: &mut Window,
+        _cx: &mut App,
+        _scope: &ModelContext<Self::Msg>,
+        _dispatcher: &Dispatcher<Self::Msg>,
+    ) -> View {
+        div().child(self.value.to_string()).into_view()
+    }
+}
+
+struct Parent {
+    sidebar: Child,
+}
+
+impl NestedModel for Parent {
+    type Msg = Msg;
+
+    fn update(
+        &mut self,
+        msg: Self::Msg,
+        cx: &mut App,
+        scope: &ModelContext<Self::Msg>,
+    ) -> Command<Self::Msg> {
+        match msg {
+            Msg::Sidebar(child_msg) => scope
+                .scope("sidebar", Msg::Sidebar)
+                .update(&mut self.sidebar, child_msg, cx),
+        }
+    }
+
+    fn view(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+        scope: &ModelContext<Self::Msg>,
+        dispatcher: &Dispatcher<Self::Msg>,
+    ) -> View {
+        scope
+            .scope("sidebar", Msg::Sidebar)
+            .view(&self.sidebar, window, cx, dispatcher)
+    }
+}
+```
+
+Run it: [`examples/nested_models.rs`](examples/nested_models.rs) with `cargo run --example nested_models`
 
 ### Observe runtime activity
 
@@ -314,9 +405,9 @@ For the complete public API surface, published documentation lives on
 - `Key`
   The stable identity used by keyed commands and subscriptions. Key reuse is what gives keyed effects and
   subscriptions their lifecycle semantics.
-- `ProgramConfig` and `RuntimeObserver`
-  Configure runtime instrumentation before mounting a program, including observers, queue warning thresholds, and
-  message and key formatters for emitted events.
+- `ProgramConfig`
+  Configure runtime instrumentation before mounting a program, including observer callbacks, queue warning
+  thresholds, and message and key formatters for emitted events.
 
 ## Runtime Guarantees
 
@@ -333,14 +424,14 @@ For the complete public API surface, published documentation lives on
   being replaced, its completion is treated as stale and does not enqueue a message
 - Subscription identity is key-based; reusing a key retains the existing handle, and changing or removing the key
   rebuilds or drops the subscription during reconciliation
-- Dispatching after a program is released fails with `DispatchError`
+- Dispatching after a program is released fails with `Error::ProgramUnavailable`
 
 These guarantees are enforced by the repository's runtime contract tests in
 [`tests/runtime_contracts.rs`](tests/runtime_contracts.rs).
 
 ## Observability
 
-`ProgramConfig` lets you observe runtime activity synchronously through a `RuntimeObserver`. The runtime can emit
+`ProgramConfig` lets you observe runtime activity synchronously through an observer callback. The runtime can emit
 events for dispatch acceptance and rejection, queue drain boundaries, queue growth warnings, command scheduling,
 keyed replacement, effect completion, stale keyed completions, and subscription lifecycle changes.
 
