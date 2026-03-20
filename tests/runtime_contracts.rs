@@ -4,8 +4,9 @@
 use futures::channel::oneshot;
 use gpui::{App, Entity, TestAppContext, Window, div};
 use gpui_tea::{
-    Command, CommandKind, Dispatcher, IntoView, Model, ModelExt, Program, ProgramConfig,
-    RuntimeEvent, SubHandle, Subscription, Subscriptions, View,
+    ChildPath, Command, CommandKind, Dispatcher, IntoView, Model, ModelContext, ModelExt,
+    NestedModel, Program, ProgramConfig, RuntimeEvent, SubHandle, Subscription, Subscriptions,
+    View,
 };
 use std::{
     collections::VecDeque,
@@ -1134,5 +1135,576 @@ fn subscriptions_are_retained_rebuilt_removed_and_can_dispatch_messages(cx: &mut
             removed: 1,
             retained: 0,
         }]
+    );
+}
+
+#[gpui::test]
+fn nested_child_init_and_update_lift_messages_through_scope(cx: &mut TestAppContext) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ChildMsg {
+        Ready,
+        Increment,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Msg {
+        Left(ChildMsg),
+        Right(ChildMsg),
+    }
+
+    struct CounterChild {
+        init_calls: usize,
+        value: i32,
+    }
+
+    impl NestedModel for CounterChild {
+        type Msg = ChildMsg;
+
+        fn init(&mut self, _cx: &mut App, _scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+            self.init_calls += 1;
+            Command::emit(ChildMsg::Ready)
+        }
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                ChildMsg::Ready => Command::none(),
+                ChildMsg::Increment => {
+                    self.value += 1;
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    struct ParentModel {
+        left: CounterChild,
+        right: CounterChild,
+        ready: Vec<&'static str>,
+    }
+
+    impl NestedModel for ParentModel {
+        type Msg = Msg;
+
+        fn init(&mut self, cx: &mut App, scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+            let left = scope.scope("left", Msg::Left);
+            let right = scope.scope("right", Msg::Right);
+
+            Command::batch([
+                left.init(&mut self.left, cx),
+                right.init(&mut self.right, cx),
+            ])
+        }
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            cx: &mut App,
+            scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Left(ChildMsg::Ready) => {
+                    self.ready.push("left");
+                    Command::none()
+                }
+                Msg::Right(ChildMsg::Ready) => {
+                    self.ready.push("right");
+                    Command::none()
+                }
+                Msg::Left(child_msg) => {
+                    scope
+                        .scope("left", Msg::Left)
+                        .update(&mut self.left, child_msg, cx)
+                }
+                Msg::Right(child_msg) => {
+                    scope
+                        .scope("right", Msg::Right)
+                        .update(&mut self.right, child_msg, cx)
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let program: Entity<Program<ParentModel>> = cx.update(|cx| {
+        ParentModel {
+            left: CounterChild {
+                init_calls: 0,
+                value: 0,
+            },
+            right: CounterChild {
+                init_calls: 0,
+                value: 0,
+            },
+            ready: Vec::new(),
+        }
+        .into_program(cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    cx.run_until_parked();
+    dispatcher.dispatch(Msg::Left(ChildMsg::Increment)).unwrap();
+    dispatcher
+        .dispatch(Msg::Right(ChildMsg::Increment))
+        .unwrap();
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().ready, vec!["left", "right"]);
+        assert_eq!(program.model().left.init_calls, 1);
+        assert_eq!(program.model().right.init_calls, 1);
+        assert_eq!(program.model().left.value, 1);
+        assert_eq!(program.model().right.value, 1);
+    });
+}
+
+#[gpui::test]
+fn sibling_nested_keyed_commands_keep_distinct_paths(cx: &mut TestAppContext) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ChildMsg {
+        Run,
+        Loaded(i32),
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Msg {
+        Left(ChildMsg),
+        Right(ChildMsg),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct KeyRecord {
+        path: Option<ChildPath>,
+        local_id: Option<String>,
+    }
+
+    struct LoaderChild {
+        value: Option<i32>,
+    }
+
+    impl NestedModel for LoaderChild {
+        type Msg = ChildMsg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                ChildMsg::Run => {
+                    Command::foreground_keyed("load", |_: &mut gpui::AsyncApp| async {
+                        Some(ChildMsg::Loaded(7))
+                    })
+                }
+                ChildMsg::Loaded(value) => {
+                    self.value = Some(value);
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    struct ParentModel {
+        left: LoaderChild,
+        right: LoaderChild,
+    }
+
+    impl NestedModel for ParentModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            cx: &mut App,
+            scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Left(child_msg) => {
+                    scope
+                        .scope("left", Msg::Left)
+                        .update(&mut self.left, child_msg, cx)
+                }
+                Msg::Right(child_msg) => {
+                    scope
+                        .scope("right", Msg::Right)
+                        .update(&mut self.right, child_msg, cx)
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let scheduled = Arc::new(Mutex::new(Vec::new()));
+    let config = ProgramConfig::default().observer({
+        let scheduled = scheduled.clone();
+        move |event: RuntimeEvent<'_, Msg>| {
+            if let RuntimeEvent::CommandScheduled { key: Some(key), .. } = event {
+                scheduled.lock().unwrap().push(KeyRecord {
+                    path: key.child_path().cloned(),
+                    local_id: key.local_id().map(ToOwned::to_owned),
+                });
+            }
+        }
+    });
+
+    let program: Entity<Program<ParentModel>> = cx.update(|cx| {
+        ParentModel {
+            left: LoaderChild { value: None },
+            right: LoaderChild { value: None },
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    dispatcher.dispatch(Msg::Left(ChildMsg::Run)).unwrap();
+    dispatcher.dispatch(Msg::Right(ChildMsg::Run)).unwrap();
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().left.value, Some(7));
+        assert_eq!(program.model().right.value, Some(7));
+    });
+    assert_eq!(
+        scheduled.lock().unwrap().as_slice(),
+        &[
+            KeyRecord {
+                path: Some(ChildPath::new("left")),
+                local_id: Some(String::from("load")),
+            },
+            KeyRecord {
+                path: Some(ChildPath::new("right")),
+                local_id: Some(String::from("load")),
+            },
+        ]
+    );
+}
+
+#[gpui::test]
+fn sibling_nested_subscriptions_do_not_conflict_on_local_keys(cx: &mut TestAppContext) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ChildMsg {
+        FromSubscription(&'static str),
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Msg {
+        Left(ChildMsg),
+        Right(ChildMsg),
+    }
+
+    struct SubscriptionChild {
+        id: &'static str,
+    }
+
+    impl NestedModel for SubscriptionChild {
+        type Msg = ChildMsg;
+
+        fn update(
+            &mut self,
+            _msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            Command::none()
+        }
+
+        fn subscriptions(
+            &self,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Subscriptions<Self::Msg> {
+            let id = self.id;
+            Subscriptions::one(Subscription::new("clock", move |cx| {
+                cx.dispatch(ChildMsg::FromSubscription(id)).unwrap();
+                SubHandle::None
+            }))
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    struct ParentModel {
+        left: SubscriptionChild,
+        right: SubscriptionChild,
+        delivered: Vec<&'static str>,
+    }
+
+    impl NestedModel for ParentModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Left(ChildMsg::FromSubscription(value))
+                | Msg::Right(ChildMsg::FromSubscription(value)) => self.delivered.push(value),
+            }
+
+            Command::none()
+        }
+
+        fn subscriptions(
+            &self,
+            cx: &mut App,
+            scope: &ModelContext<Self::Msg>,
+        ) -> Subscriptions<Self::Msg> {
+            let left = scope.scope("left", Msg::Left);
+            let right = scope.scope("right", Msg::Right);
+            let mut subscriptions = Subscriptions::none();
+            for subscription in left.subscriptions(&self.left, cx) {
+                subscriptions
+                    .push(subscription)
+                    .expect("left child subscriptions should keep unique keys");
+            }
+            for subscription in right.subscriptions(&self.right, cx) {
+                subscriptions
+                    .push(subscription)
+                    .expect("right child subscriptions should keep unique keys");
+            }
+            subscriptions
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let program: Entity<Program<ParentModel>> = cx.update(|cx| {
+        ParentModel {
+            left: SubscriptionChild { id: "left" },
+            right: SubscriptionChild { id: "right" },
+            delivered: Vec::new(),
+        }
+        .into_program(cx)
+    });
+
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().delivered, vec!["left", "right"]);
+    });
+}
+
+#[gpui::test]
+fn deep_nested_scope_rebases_grandchild_keys(cx: &mut TestAppContext) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GrandChildMsg {
+        Run,
+        Loaded,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ChildMsg {
+        RunGrandchild,
+        Grandchild(GrandChildMsg),
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Msg {
+        Child(ChildMsg),
+    }
+
+    struct Grandchild {
+        completed: bool,
+    }
+
+    impl NestedModel for Grandchild {
+        type Msg = GrandChildMsg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                GrandChildMsg::Run => {
+                    Command::foreground_keyed("load", |_: &mut gpui::AsyncApp| async {
+                        Some(GrandChildMsg::Loaded)
+                    })
+                }
+                GrandChildMsg::Loaded => {
+                    self.completed = true;
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    struct ChildModel {
+        grandchild: Grandchild,
+    }
+
+    impl NestedModel for ChildModel {
+        type Msg = ChildMsg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            cx: &mut App,
+            scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            let grandchild = scope.scope("grandchild", ChildMsg::Grandchild);
+            match msg {
+                ChildMsg::RunGrandchild => {
+                    grandchild.update(&mut self.grandchild, GrandChildMsg::Run, cx)
+                }
+                ChildMsg::Grandchild(grandchild_msg) => {
+                    grandchild.update(&mut self.grandchild, grandchild_msg, cx)
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    struct ParentModel {
+        child: ChildModel,
+    }
+
+    impl NestedModel for ParentModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            cx: &mut App,
+            scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Child(child_msg) => {
+                    scope
+                        .scope("child", Msg::Child)
+                        .update(&mut self.child, child_msg, cx)
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let observed_keys = Arc::new(Mutex::new(Vec::new()));
+    let config = ProgramConfig::default().observer({
+        let observed_keys = observed_keys.clone();
+        move |event: RuntimeEvent<'_, Msg>| {
+            if let RuntimeEvent::EffectCompleted { key: Some(key), .. } = event {
+                observed_keys.lock().unwrap().push((
+                    key.child_path().cloned(),
+                    key.local_id().map(ToOwned::to_owned),
+                ));
+            }
+        }
+    });
+
+    let program: Entity<Program<ParentModel>> = cx.update(|cx| {
+        ParentModel {
+            child: ChildModel {
+                grandchild: Grandchild { completed: false },
+            },
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    dispatcher
+        .dispatch(Msg::Child(ChildMsg::RunGrandchild))
+        .unwrap();
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        assert!(program.model().child.grandchild.completed);
+    });
+    assert_eq!(
+        observed_keys.lock().unwrap().as_slice(),
+        &[(
+            Some(ChildPath::new("child").child("grandchild")),
+            Some(String::from("load"))
+        )]
     );
 }
