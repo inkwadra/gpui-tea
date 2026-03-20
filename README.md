@@ -42,6 +42,8 @@ while preserving direct access to GPUI's rendering and application model.
 - Keyed commands with latest-wins completion semantics
 - Declarative subscriptions keyed by stable identity
 - Runtime hooks for queue, command, effect, and subscription lifecycle events
+- Structured telemetry envelopes for tracing and metrics adapters
+- Configurable queue policies and read-only runtime snapshots
 
 ## Requirements
 
@@ -406,8 +408,10 @@ For the complete public API surface, published documentation lives on
   The stable identity used by keyed commands and subscriptions. Key reuse is what gives keyed effects and
   subscriptions their lifecycle semantics.
 - `ProgramConfig`
-  Configure runtime instrumentation before mounting a program, including observer callbacks, queue warning
-  thresholds, and message and key formatters for emitted events.
+  Configure runtime instrumentation before mounting a program, including observer callbacks, telemetry
+  observers, queue policies, queue warning thresholds, and message/key/program formatters for emitted events.
+- `RuntimeSnapshot`
+  A read-only summary of queue depth, drain status, active keyed tasks, and active subscriptions for a mounted program.
 
 ## Runtime Guarantees
 
@@ -442,6 +446,14 @@ meaningful form.
 Use `Command::label` and `Subscription::label` when you need event streams to carry names for specific effects or
 subscription builders. Labels become visible in runtime events such as `CommandScheduled`, `EffectCompleted`,
 `SubscriptionBuilt`, `SubscriptionRetained`, and `SubscriptionRemoved`.
+
+`ProgramConfig::telemetry_observer` emits `TelemetryEnvelope` values with `ProgramId`, monotonic `event_id`,
+`emitted_at`, and `queue_depth` metadata. The recommended production path is to keep callbacks cheap and wire
+structured telemetry into optional adapters such as `observe_tracing_telemetry` or `observe_metrics_telemetry`.
+
+Queue controls are configured through `ProgramConfig::queue_policy`. `QueuePolicy::Unbounded` preserves the
+existing behavior. `RejectNew`, `DropNewest`, and `DropOldest` let applications trade throughput for bounded
+memory without changing GPUI lifecycle semantics.
 
 ## Development
 
