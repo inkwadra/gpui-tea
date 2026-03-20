@@ -1,49 +1,35 @@
 use crate::command::{CommandInner, Effect};
-use crate::observability::{ProgramConfig, RuntimeEvent};
-use crate::runtime::{CommandMeta, KeyedEffectContext, Runtime};
+use crate::observability::{
+    Observability, ProgramConfig, QueueOverflowAction, RuntimeEvent, TelemetryEvent,
+};
+use crate::runtime::{
+    CommandMeta, KeyedEffectContext, QueueReservation, QueueTracker, QueuedMessage, Runtime,
+};
 use crate::{
     Command, CommandKind, Dispatcher, Key, ModelContext, NestedModel, Subscriptions, View,
 };
 use futures::StreamExt;
 use gpui::{App, AppContext, AsyncApp, Context, Entity, IntoElement, Render, Task, Window};
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 /// Define the application state and transition contract for a [`Program`].
-///
-/// A model owns the current state, updates that state in response to messages,
-/// renders GPUI elements, and declares any long-lived subscriptions needed for
-/// the current state.
 pub trait Model: Sized + 'static {
     /// Name the message type consumed by [`Model::update`] and produced by
     /// commands and subscriptions.
     type Msg: Send + 'static;
 
     /// Initialize the model and return an initial command.
-    ///
-    /// [`Program::mount`] and [`Program::mount_with`] call this exactly once
-    /// after creating the runtime and before the initial subscription
-    /// reconciliation.
     fn init(&mut self, _cx: &mut App) -> Command<Self::Msg> {
         Command::none()
     }
 
     /// Update the model in response to a single message.
-    ///
-    /// The runtime processes messages in FIFO order. If an update emits or
-    /// dispatches more messages, they are appended to the queue and processed
-    /// later instead of re-entering `update` recursively.
     fn update(&mut self, msg: Self::Msg, cx: &mut App) -> Command<Self::Msg>;
 
     /// Render the current model state as GPUI elements.
-    ///
-    /// Use `dispatcher` inside event handlers to enqueue follow-up messages back
-    /// into the same program instance.
     fn view(&self, window: &mut Window, cx: &mut App, dispatcher: &Dispatcher<Self::Msg>) -> View;
 
     /// Return the declarative subscriptions required by the current model state.
-    ///
-    /// The runtime reconciles this set after `init` and after each queue-drain
-    /// pass that processed at least one message.
     fn subscriptions(&self, _cx: &mut App) -> Subscriptions<Self::Msg> {
         Subscriptions::none()
     }
@@ -84,10 +70,20 @@ impl<T: Model> NestedModel for T {
     }
 }
 
+/// Report a read-only snapshot of the mounted runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeSnapshot {
+    /// Report how many messages remain logically queued.
+    pub queue_depth: usize,
+    /// Report whether the runtime is currently draining its queue.
+    pub is_draining: bool,
+    /// Report how many keyed tasks remain active.
+    pub active_keyed_tasks: usize,
+    /// Report how many subscriptions remain active.
+    pub active_subscriptions: usize,
+}
+
 /// Host a [`Model`] inside a GPUI entity and drive the TEA runtime.
-///
-/// A program owns the model, message queue, keyed task tracking, subscription
-/// registry, and runtime configuration for a single mounted instance.
 pub struct Program<M: NestedModel> {
     model: M,
     runtime: Runtime<M::Msg>,
@@ -107,8 +103,17 @@ where
 
 impl<M: NestedModel> Program<M> {
     fn build_runtime(config: ProgramConfig<M::Msg>, cx: &mut Context<'_, Self>) -> Runtime<M::Msg> {
+        let queue_policy = config.queue_policy;
+        let queue_tracker = Arc::new(QueueTracker::new(queue_policy));
+        let observability = Observability::new(
+            config,
+            Arc::new({
+                let queue_tracker = queue_tracker.clone();
+                move || queue_tracker.depth()
+            }),
+        );
         let (sender, mut receiver) = futures::channel::mpsc::unbounded();
-        let dispatcher = Dispatcher::new(sender, config.clone());
+        let dispatcher = Dispatcher::new(sender, queue_tracker.clone(), observability.clone());
         let program = cx.weak_entity();
         let receive_task = cx.spawn(move |_this, async_cx: &mut AsyncApp| {
             let mut async_cx = async_cx.clone();
@@ -116,87 +121,24 @@ impl<M: NestedModel> Program<M> {
                 while let Some(message) = receiver.next().await {
                     program
                         .update(&mut async_cx, |program, cx| {
-                            program.dispatch(message, cx);
+                            program.receive_enqueued(message, cx);
                         })
                         .ok();
                 }
             }
         });
 
-        Runtime::new(dispatcher, receive_task, config)
+        Runtime::new(dispatcher, queue_tracker, receive_task, observability)
     }
 
     /// Create, initialize, and mount a program entity with the default
     /// configuration.
-    ///
-    /// The runtime is created first, then [`Model::init`] runs, the returned
-    /// command executes, and finally the initial subscription set is
-    /// reconciled.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use gpui::{App, Window, div};
-    /// use gpui_tea::{Command, Dispatcher, IntoView, Model, Program, View};
-    ///
-    /// #[derive(Clone, Copy)]
-    /// enum Msg {
-    ///     Increment,
-    ///     Decrement,
-    ///     Reset,
-    /// }
-    ///
-    /// struct Counter {
-    ///     value: i32,
-    /// }
-    ///
-    /// impl Model for Counter {
-    ///     type Msg = Msg;
-    ///
-    ///     fn init(&mut self, _cx: &mut App) -> Command<Self::Msg> {
-    ///         Command::none()
-    ///     }
-    ///
-    ///     fn update(&mut self, msg: Self::Msg, _cx: &mut App) -> Command<Self::Msg> {
-    ///         match msg {
-    ///             Msg::Increment => {
-    ///                 self.value += 1;
-    ///                 Command::none()
-    ///             }
-    ///             Msg::Decrement => {
-    ///                 self.value -= 1;
-    ///                 Command::none()
-    ///             }
-    ///             Msg::Reset => {
-    ///                 self.value = 0;
-    ///                 Command::none()
-    ///             }
-    ///         }
-    ///     }
-    ///
-    ///     fn view(
-    ///         &self,
-    ///         _window: &mut Window,
-    ///         _cx: &mut App,
-    ///         _dispatcher: &Dispatcher<Self::Msg>,
-    ///     ) -> View {
-    ///         div().into_view()
-    ///     }
-    /// }
-    ///
-    /// # fn mount(cx: &mut App) {
-    /// let _program = Program::mount(Counter { value: 0 }, cx);
-    /// # }
-    /// ```
     pub fn mount(model: M, cx: &mut App) -> Entity<Self> {
         Self::mount_with(model, ProgramConfig::default(), cx)
     }
 
     /// Create, initialize, and mount a program entity with an explicit
     /// configuration.
-    ///
-    /// This follows the same lifecycle as [`Program::mount`] while also
-    /// applying the supplied [`ProgramConfig`].
     pub fn mount_with(model: M, config: ProgramConfig<M::Msg>, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
             let runtime = Self::build_runtime(config, cx);
@@ -213,34 +155,89 @@ impl<M: NestedModel> Program<M> {
         &self.model
     }
 
+    /// Return a read-only runtime snapshot.
+    pub fn runtime_snapshot(&self) -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            queue_depth: self.runtime.queue_tracker.depth(),
+            is_draining: self.runtime.queue.is_draining,
+            active_keyed_tasks: self.runtime.tasks.len(),
+            active_subscriptions: self.runtime.subscriptions.len(),
+        }
+    }
+
     /// Get an enqueue-only handle for sending messages to this program.
-    ///
-    /// Cloning the returned dispatcher is cheap because it shares the same
-    /// underlying queue handle.
     pub fn dispatcher(&self) -> Dispatcher<M::Msg> {
         self.runtime.dispatcher.clone()
     }
 
-    pub(crate) fn dispatch(&mut self, message: M::Msg, cx: &mut Context<'_, Self>) {
-        self.runtime.queue.pending.push_back(message);
+    fn receive_enqueued(&mut self, queued: QueuedMessage<M::Msg>, cx: &mut Context<'_, Self>) {
+        if self.runtime.queue_tracker.take_if_dropped(queued.id) {
+            return;
+        }
+
+        self.runtime.queue.pending.push_back(queued);
         self.observe_queue_warning_if_needed();
         self.drain_queue(cx);
     }
 
+    fn enqueue_message(&mut self, message: M::Msg, cx: &mut Context<'_, Self>) {
+        let message_description = self.runtime.observability.describe_message_value(&message);
+        let reservation = self.runtime.queue_tracker.reserve_enqueue();
+
+        match reservation {
+            QueueReservation::Rejected => {
+                self.runtime
+                    .observability
+                    .observe_telemetry(TelemetryEvent::QueueOverflow {
+                        policy: self.runtime.observability.queue_policy(),
+                        action: QueueOverflowAction::RejectedNew,
+                        message_description,
+                    });
+            }
+            QueueReservation::DroppedNewest => {
+                self.runtime
+                    .observability
+                    .observe_telemetry(TelemetryEvent::QueueOverflow {
+                        policy: self.runtime.observability.queue_policy(),
+                        action: QueueOverflowAction::DroppedNewest,
+                        message_description,
+                    });
+            }
+            QueueReservation::Accepted {
+                id,
+                overflow_action,
+                ..
+            } => {
+                if let Some(action) = overflow_action {
+                    self.runtime
+                        .observability
+                        .observe_telemetry(TelemetryEvent::QueueOverflow {
+                            policy: self.runtime.observability.queue_policy(),
+                            action,
+                            message_description: message_description.clone(),
+                        });
+                }
+
+                self.receive_enqueued(QueuedMessage { id, message }, cx);
+            }
+        }
+    }
+
     fn observe_queue_warning_if_needed(&self) {
-        if let Some(threshold) = self.runtime.config.queue_warning_threshold {
-            let queued = self.runtime.queue.pending.len();
+        if let Some(threshold) = self.runtime.observability.queue_warning_threshold() {
+            let queued = self.runtime.queue_tracker.depth();
             if queued > threshold {
                 self.runtime
-                    .config
-                    .observe(RuntimeEvent::QueueWarning { queued, threshold });
+                    .observability
+                    .observe_runtime(RuntimeEvent::QueueWarning { queued, threshold });
+                self.runtime
+                    .observability
+                    .observe_telemetry(TelemetryEvent::QueueWarning { queued, threshold });
             }
         }
     }
 
     fn drain_queue(&mut self, cx: &mut Context<'_, Self>) {
-        // Re-entrant dispatch appends to `pending`; only the outermost caller
-        // performs the drain.
         if self.runtime.queue.is_draining {
             return;
         }
@@ -248,19 +245,38 @@ impl<M: NestedModel> Program<M> {
         self.runtime.queue.is_draining = true;
         let queued = self.runtime.queue.pending.len();
         self.runtime
-            .config
-            .observe(RuntimeEvent::QueueDrainStarted { queued });
+            .observability
+            .observe_runtime(RuntimeEvent::QueueDrainStarted { queued });
+        self.runtime
+            .observability
+            .observe_telemetry(TelemetryEvent::QueueDrainStarted { queued });
 
         let mut processed = 0;
 
-        while let Some(message) = self.runtime.queue.pending.pop_front() {
-            let message_description = self.runtime.config.describe_message_value(&message);
-            self.runtime.config.observe(RuntimeEvent::MessageProcessed {
-                message: &message,
-                message_description,
-            });
+        while let Some(queued) = self.runtime.queue.pending.pop_front() {
+            if self.runtime.queue_tracker.take_if_dropped(queued.id) {
+                continue;
+            }
 
-            let command = self.model.update(message, cx, &ModelContext::root());
+            self.runtime.queue_tracker.complete_processed(queued.id);
+            let message_description = self
+                .runtime
+                .observability
+                .describe_message_value(&queued.message);
+            self.runtime
+                .observability
+                .observe_runtime(RuntimeEvent::MessageProcessed {
+                    message: &queued.message,
+                    message_description: message_description.clone(),
+                });
+            self.runtime
+                .observability
+                .observe_telemetry(TelemetryEvent::MessageProcessed {
+                    message: &queued.message,
+                    message_description,
+                });
+
+            let command = self.model.update(queued.message, cx, &ModelContext::root());
             processed += 1;
             self.execute_command(command, cx);
         }
@@ -272,11 +288,18 @@ impl<M: NestedModel> Program<M> {
             cx.notify();
         }
 
+        let remaining = self.runtime.queue.pending.len();
         self.runtime
-            .config
-            .observe(RuntimeEvent::QueueDrainFinished {
+            .observability
+            .observe_runtime(RuntimeEvent::QueueDrainFinished {
                 processed,
-                remaining: self.runtime.queue.pending.len(),
+                remaining,
+            });
+        self.runtime
+            .observability
+            .observe_telemetry(TelemetryEvent::QueueDrainFinished {
+                processed,
+                remaining,
             });
     }
 
@@ -289,7 +312,7 @@ impl<M: NestedModel> Program<M> {
                 let meta = CommandMeta::new(CommandKind::Emit, label);
                 self.observe_command_scheduled(&meta, None);
                 self.observe_effect_completed(&meta, None, Some(&message));
-                self.dispatch(message, cx);
+                self.enqueue_message(message, cx);
             }
             CommandInner::Batch(commands) => {
                 for command in commands {
@@ -299,47 +322,103 @@ impl<M: NestedModel> Program<M> {
             CommandInner::Effect(effect) => {
                 let meta = CommandMeta::new(effect.kind(), label);
                 self.observe_command_scheduled(&meta, None);
+                self.observe_effect_started(&meta, None);
                 Self::spawn_effect(effect, meta, None, cx).detach();
             }
             CommandInner::Keyed { key, effect } => {
                 let meta = CommandMeta::new(effect.kind(), label);
                 self.observe_command_scheduled(&meta, Some(&key));
+                self.observe_effect_started(&meta, Some(&key));
                 let generation = self.runtime.tasks.next_generation();
                 let keyed = KeyedEffectContext {
                     key: key.clone(),
                     generation,
                 };
                 let task = Self::spawn_effect(effect, meta.clone(), Some(keyed), cx);
-                // Replacing the active entry makes the new generation current
-                // and lets any older completion be recognized as stale.
                 let previous =
                     self.runtime
                         .tasks
                         .insert(key.clone(), generation, meta.clone(), task);
 
                 if let Some(previous) = previous {
-                    self.runtime
-                        .config
-                        .observe(RuntimeEvent::KeyedCommandReplaced {
+                    let previous_kind = previous.meta.kind;
+                    let previous_label = previous.meta.label().map(ToOwned::to_owned);
+                    previous.task.detach();
+                    self.runtime.observability.observe_runtime(
+                        RuntimeEvent::KeyedCommandReplaced {
                             key: &key,
-                            key_description: self.runtime.config.describe_key_value(&key),
-                            previous_kind: previous.kind,
-                            previous_label: previous.label(),
+                            key_description: self.runtime.observability.describe_key_value(&key),
+                            previous_kind,
+                            previous_label: previous_label.as_deref(),
                             next_kind: meta.kind,
                             next_label: meta.label(),
-                        });
+                        },
+                    );
+                    self.runtime.observability.observe_telemetry(
+                        TelemetryEvent::KeyedCommandReplaced {
+                            key: &key,
+                            key_description: self.runtime.observability.describe_key_value(&key),
+                            previous_kind,
+                            previous_label: previous_label.as_deref(),
+                            next_kind: meta.kind,
+                            next_label: meta.label(),
+                        },
+                    );
                 }
+            }
+            CommandInner::Cancel(key) => {
+                self.cancel_keyed_command(&key);
             }
         }
     }
 
+    fn cancel_keyed_command(&mut self, key: &Key) {
+        if let Some(running) = self.runtime.tasks.cancel(key) {
+            let canceled_kind = running.meta.kind;
+            let canceled_label = running.meta.label().map(ToOwned::to_owned);
+            running.task.detach();
+            self.runtime
+                .observability
+                .observe_telemetry(TelemetryEvent::KeyedCommandCanceled {
+                    key,
+                    key_description: self.runtime.observability.describe_key_value(key),
+                    canceled_kind,
+                    canceled_label: canceled_label.as_deref(),
+                });
+        }
+    }
+
     fn observe_command_scheduled(&self, meta: &CommandMeta, key: Option<&Key>) {
-        self.runtime.config.observe(RuntimeEvent::CommandScheduled {
-            kind: meta.kind,
-            label: meta.label(),
-            key,
-            key_description: key.and_then(|key| self.runtime.config.describe_key_value(key)),
-        });
+        self.runtime
+            .observability
+            .observe_runtime(RuntimeEvent::CommandScheduled {
+                kind: meta.kind,
+                label: meta.label(),
+                key,
+                key_description: key
+                    .and_then(|key| self.runtime.observability.describe_key_value(key)),
+            });
+        self.runtime
+            .observability
+            .observe_telemetry(TelemetryEvent::CommandScheduled {
+                kind: meta.kind,
+                label: meta.label(),
+                key,
+                key_description: key
+                    .and_then(|key| self.runtime.observability.describe_key_value(key)),
+            });
+    }
+
+    fn observe_effect_started(&self, meta: &CommandMeta, key: Option<&Key>) {
+        self.runtime
+            .observability
+            .observe_telemetry(TelemetryEvent::EffectStarted {
+                kind: meta.kind,
+                label: meta.label(),
+                key,
+                key_description: key
+                    .and_then(|key| self.runtime.observability.describe_key_value(key)),
+            });
     }
 
     fn observe_effect_completed(
@@ -348,16 +427,33 @@ impl<M: NestedModel> Program<M> {
         key: Option<&Key>,
         message: Option<&M::Msg>,
     ) {
-        self.runtime.config.observe(RuntimeEvent::EffectCompleted {
-            kind: meta.kind,
-            label: meta.label(),
-            key,
-            key_description: key.and_then(|key| self.runtime.config.describe_key_value(key)),
-            emitted_message: message.is_some(),
-            message,
-            message_description: message
-                .and_then(|message| self.runtime.config.describe_message_value(message)),
-        });
+        let key_description =
+            key.and_then(|key| self.runtime.observability.describe_key_value(key));
+        let message_description =
+            message.and_then(|message| self.runtime.observability.describe_message_value(message));
+
+        self.runtime
+            .observability
+            .observe_runtime(RuntimeEvent::EffectCompleted {
+                kind: meta.kind,
+                label: meta.label(),
+                key,
+                key_description: key_description.clone(),
+                emitted_message: message.is_some(),
+                message,
+                message_description: message_description.clone(),
+            });
+        self.runtime
+            .observability
+            .observe_telemetry(TelemetryEvent::EffectCompleted {
+                kind: meta.kind,
+                label: meta.label(),
+                key,
+                key_description,
+                emitted_message: message.is_some(),
+                message,
+                message_description,
+            });
     }
 
     fn apply_completion(
@@ -376,25 +472,39 @@ impl<M: NestedModel> Program<M> {
                     .tasks
                     .clear_current(&keyed.key, keyed.generation);
                 if let Some(message) = message {
-                    self.dispatch(message, cx);
+                    self.enqueue_message(message, cx);
                 }
             } else {
-                self.runtime
-                    .config
-                    .observe(RuntimeEvent::StaleKeyedCompletionIgnored {
+                let key_description = self.runtime.observability.describe_key_value(&keyed.key);
+                let message_description = message
+                    .as_ref()
+                    .and_then(|message| self.runtime.observability.describe_message_value(message));
+
+                self.runtime.observability.observe_runtime(
+                    RuntimeEvent::StaleKeyedCompletionIgnored {
                         kind: meta.kind,
                         label: meta.label(),
                         key: &keyed.key,
-                        key_description: self.runtime.config.describe_key_value(&keyed.key),
+                        key_description: key_description.clone(),
                         emitted_message: message.is_some(),
                         message: message.as_ref(),
-                        message_description: message.as_ref().and_then(|message| {
-                            self.runtime.config.describe_message_value(message)
-                        }),
-                    });
+                        message_description: message_description.clone(),
+                    },
+                );
+                self.runtime.observability.observe_telemetry(
+                    TelemetryEvent::StaleKeyedCompletionIgnored {
+                        kind: meta.kind,
+                        label: meta.label(),
+                        key: &keyed.key,
+                        key_description,
+                        emitted_message: message.is_some(),
+                        message: message.as_ref(),
+                        message_description,
+                    },
+                );
             }
         } else if let Some(message) = message {
-            self.dispatch(message, cx);
+            self.enqueue_message(message, cx);
         }
     }
 
@@ -442,13 +552,21 @@ impl<M: NestedModel> Program<M> {
         let stats = self.runtime.subscriptions.reconcile(
             subscriptions,
             &dispatcher,
-            &self.runtime.config,
+            &self.runtime.observability,
             cx,
         );
 
         self.runtime
-            .config
-            .observe(RuntimeEvent::SubscriptionsReconciled {
+            .observability
+            .observe_runtime(RuntimeEvent::SubscriptionsReconciled {
+                active: stats.active,
+                added: stats.added,
+                removed: stats.removed,
+                retained: stats.retained,
+            });
+        self.runtime
+            .observability
+            .observe_telemetry(TelemetryEvent::SubscriptionsReconciled {
                 active: stats.active,
                 added: stats.added,
                 removed: stats.removed,
@@ -468,15 +586,11 @@ impl<M: NestedModel> Render for Program<M> {
 /// Mount a [`Model`] as a fully initialized [`Program`].
 pub trait ModelExt: NestedModel {
     /// Mount this model as a fully initialized program entity.
-    ///
-    /// This is a convenience wrapper around [`Program::mount`].
     fn into_program(self, cx: &mut App) -> Entity<Program<Self>> {
         Program::mount(self, cx)
     }
 
     /// Mount this model with an explicit runtime configuration.
-    ///
-    /// This is a convenience wrapper around [`Program::mount_with`].
     fn into_program_with(
         self,
         config: ProgramConfig<Self::Msg>,
@@ -491,8 +605,10 @@ impl<M: NestedModel> ModelExt for M {}
 #[cfg(test)]
 mod runtime_tests {
     use super::*;
-    use crate::IntoView;
+    use crate::{IntoView, QueuePolicy};
+    use futures::channel::oneshot;
     use gpui::{Entity, Task, TestAppContext, Window, div};
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Debug, PartialEq)]
@@ -582,6 +698,174 @@ mod runtime_tests {
         assert_eq!(
             events.lock().unwrap().as_slice(),
             &[Some(String::from("set:7"))]
+        );
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    #[gpui::test]
+    fn runtime_snapshot_reports_current_counts_without_side_effects(cx: &mut TestAppContext) {
+        let program: Entity<Program<TestModel>> =
+            cx.update(|cx| TestModel { state: 0 }.into_program(cx));
+
+        let before = program.read_with(cx, |program, _cx| program.runtime_snapshot());
+        let after = program.read_with(cx, |program, _cx| program.runtime_snapshot());
+
+        assert_eq!(before, after);
+        assert_eq!(before.queue_depth, 0);
+        assert!(!before.is_draining);
+        assert_eq!(before.active_keyed_tasks, 0);
+        assert_eq!(before.active_subscriptions, 0);
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    #[gpui::test]
+    fn internal_enqueue_respects_reject_new_policy_without_extra_notify(cx: &mut TestAppContext) {
+        struct RejectModel {
+            renders: Arc<Mutex<usize>>,
+        }
+
+        impl Model for RejectModel {
+            type Msg = Msg;
+
+            fn update(&mut self, msg: Self::Msg, _cx: &mut App) -> Command<Self::Msg> {
+                match msg {
+                    Msg::Set(0) => {
+                        Command::batch([Command::emit(Msg::Set(1)), Command::emit(Msg::Set(2))])
+                    }
+                    Msg::Set(_) => Command::none(),
+                }
+            }
+
+            fn view(
+                &self,
+                _window: &mut Window,
+                _cx: &mut App,
+                _dispatcher: &Dispatcher<Self::Msg>,
+            ) -> View {
+                *self.renders.lock().unwrap() += 1;
+                div().into_view()
+            }
+        }
+
+        let renders = Arc::new(Mutex::new(0));
+        let program: Entity<Program<RejectModel>> = cx.update(|cx| {
+            RejectModel {
+                renders: renders.clone(),
+            }
+            .into_program_with(
+                ProgramConfig::default().queue_policy(QueuePolicy::RejectNew { capacity: 1 }),
+                cx,
+            )
+        });
+        let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+        dispatcher.dispatch(Msg::Set(0)).unwrap();
+        cx.run_until_parked();
+
+        let snapshot = program.read_with(cx, |program, _cx| program.runtime_snapshot());
+        assert_eq!(snapshot.queue_depth, 0);
+    }
+
+    #[allow(clippy::missing_panics_doc, clippy::too_many_lines)]
+    #[gpui::test]
+    fn cancel_key_clears_tracked_task_and_emits_telemetry(cx: &mut TestAppContext) {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum CancelMsg {
+            RunNext,
+            Loaded(i32),
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum CancelEvent {
+            Canceled(Option<String>),
+            Stale(Option<String>),
+        }
+
+        struct CancelModel {
+            commands: VecDeque<Command<CancelMsg>>,
+            values: Vec<i32>,
+        }
+
+        impl Model for CancelModel {
+            type Msg = CancelMsg;
+
+            fn update(&mut self, msg: Self::Msg, _cx: &mut App) -> Command<Self::Msg> {
+                match msg {
+                    CancelMsg::RunNext => self.commands.pop_front().unwrap_or_else(Command::none),
+                    CancelMsg::Loaded(value) => {
+                        self.values.push(value);
+                        Command::none()
+                    }
+                }
+            }
+
+            fn view(
+                &self,
+                _window: &mut Window,
+                _cx: &mut App,
+                _dispatcher: &Dispatcher<Self::Msg>,
+            ) -> View {
+                div().into_view()
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (sender, receiver) = oneshot::channel();
+        let config = ProgramConfig::default()
+            .describe_message(|msg: &CancelMsg| match msg {
+                CancelMsg::RunNext => String::from("run-next"),
+                CancelMsg::Loaded(value) => format!("loaded:{value}"),
+            })
+            .describe_key(|key| format!("{key:?}"))
+            .telemetry_observer({
+                let events = events.clone();
+                move |envelope| match envelope.event {
+                    TelemetryEvent::KeyedCommandCanceled {
+                        key_description, ..
+                    } => events.lock().unwrap().push(CancelEvent::Canceled(
+                        key_description.map(|value| value.to_string()),
+                    )),
+                    TelemetryEvent::StaleKeyedCompletionIgnored {
+                        message_description,
+                        ..
+                    } => events.lock().unwrap().push(CancelEvent::Stale(
+                        message_description.map(|value| value.to_string()),
+                    )),
+                    _ => {}
+                }
+            });
+
+        let program: Entity<Program<CancelModel>> = cx.update(|cx| {
+            CancelModel {
+                commands: VecDeque::from([
+                    Command::background_keyed("load", move |_| async move {
+                        receiver.await.ok().map(CancelMsg::Loaded)
+                    })
+                    .label("load"),
+                    Command::cancel_key("load"),
+                ]),
+                values: Vec::new(),
+            }
+            .into_program_with(config, cx)
+        });
+        let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+        dispatcher.dispatch(CancelMsg::RunNext).unwrap();
+        cx.run_until_parked();
+        dispatcher.dispatch(CancelMsg::RunNext).unwrap();
+        sender.send(8).unwrap();
+        cx.run_until_parked();
+
+        program.read_with(cx, |program, _cx| {
+            assert!(program.model().values.is_empty());
+            assert_eq!(program.runtime_snapshot().active_keyed_tasks, 0);
+        });
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[
+                CancelEvent::Canceled(Some(String::from("Key(\"load\")"))),
+                CancelEvent::Stale(Some(String::from("loaded:8"))),
+            ]
         );
     }
 }

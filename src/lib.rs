@@ -200,7 +200,7 @@
 //! }
 //! ```
 //!
-//! [`ProgramConfig`] can attach runtime observers and format event payloads:
+//! [`ProgramConfig`] can attach runtime observers and structured telemetry:
 //!
 //! ```no_run
 //! use gpui::{App, Window, div};
@@ -233,13 +233,15 @@
 //!
 //! # fn mount(cx: &mut App) {
 //! let config = ProgramConfig::new()
+//!     .describe_program(|program_id| format!("program:{program_id}"))
 //!     .describe_message(|_msg: &Msg| "run")
 //!     .describe_key(|key| format!("{key:?}"))
 //!     .observer(|event| {
 //!         if let RuntimeEvent::EffectCompleted { label, .. } = event {
 //!             let _ = label;
 //!         }
-//!     });
+//!     })
+//!     .telemetry_observer(|_envelope| {});
 //!
 //! let _program = Program::mount_with(Observed, config, cx);
 //! # }
@@ -247,7 +249,8 @@
 //!
 //! Runnable examples for these scenarios live in `examples/counter.rs`,
 //! `examples/init_command.rs`, `examples/keyed_effect.rs`,
-//! `examples/subscriptions.rs`, and `examples/observability.rs`.
+//! `examples/subscriptions.rs`, `examples/observability.rs`, and
+//! `examples/telemetry.rs`.
 
 mod command;
 mod dispatcher;
@@ -263,7 +266,14 @@ pub use command::{Command, CommandKind, Key};
 pub use dispatcher::Dispatcher;
 pub use error::{Error, Result};
 pub use nested::{ChildPath, ChildScope, ModelContext, NestedModel};
-pub use observability::{ProgramConfig, RuntimeEvent};
-pub use program::{Model, ModelExt, Program};
+#[cfg(feature = "metrics")]
+pub use observability::observe_metrics_telemetry;
+#[cfg(feature = "tracing")]
+pub use observability::observe_tracing_telemetry;
+pub use observability::{
+    ProgramConfig, ProgramId, QueueOverflowAction, QueuePolicy, RuntimeEvent, TelemetryEnvelope,
+    TelemetryEvent, TelemetryMetadata,
+};
+pub use program::{Model, ModelExt, Program, RuntimeSnapshot};
 pub use subscription::{SubHandle, Subscription, SubscriptionContext, Subscriptions};
 pub use view::{IntoView, View};
