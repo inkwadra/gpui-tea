@@ -45,7 +45,9 @@ impl Model for SubscriptionDemo {
 
         Subscriptions::one(
             Subscription::new(key, move |cx| {
-                let _ = cx.dispatch(Msg::FromSubscription(key));
+                cx.dispatch(Msg::FromSubscription(key)).expect(
+                    "the mounted subscription demo program should be alive while building subscriptions",
+                );
                 SubHandle::None
             })
             .label(match key {
@@ -97,7 +99,9 @@ impl Model for SubscriptionDemo {
                                 .on_click({
                                     let dispatcher = dispatcher.clone();
                                     move |_event, _window, _cx| {
-                                        let _ = dispatcher.dispatch(Msg::UseAlpha);
+                                        dispatcher
+                                            .dispatch(Msg::UseAlpha)
+                                            .expect("the mounted subscription demo should accept selection changes");
                                     }
                                 }),
                         )
@@ -108,7 +112,9 @@ impl Model for SubscriptionDemo {
                                 .on_click({
                                     let dispatcher = dispatcher.clone();
                                     move |_event, _window, _cx| {
-                                        let _ = dispatcher.dispatch(Msg::UseBeta);
+                                        dispatcher
+                                            .dispatch(Msg::UseBeta)
+                                            .expect("the mounted subscription demo should accept selection changes");
                                     }
                                 }),
                         )
@@ -119,7 +125,9 @@ impl Model for SubscriptionDemo {
                                 .on_click({
                                     let dispatcher = dispatcher.clone();
                                     move |_event, _window, _cx| {
-                                        let _ = dispatcher.dispatch(Msg::Clear);
+                                        dispatcher
+                                            .dispatch(Msg::Clear)
+                                            .expect("the mounted subscription demo should accept clear requests");
                                     }
                                 }),
                         ),

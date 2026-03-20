@@ -90,7 +90,9 @@ impl Model for KeyedEffectDemo {
                                 .on_click({
                                     let dispatcher = dispatcher.clone();
                                     move |_event, _window, _cx| {
-                                        let _ = dispatcher.dispatch(Msg::RunDemo);
+                                        dispatcher
+                                            .dispatch(Msg::RunDemo)
+                                            .expect("the mounted demo program should accept run requests");
                                     }
                                 }),
                         )
@@ -101,7 +103,9 @@ impl Model for KeyedEffectDemo {
                                 .on_click({
                                     let dispatcher = dispatcher.clone();
                                     move |_event, _window, _cx| {
-                                        let _ = dispatcher.dispatch(Msg::Clear);
+                                        dispatcher
+                                            .dispatch(Msg::Clear)
+                                            .expect("the mounted demo program should accept clear requests");
                                     }
                                 }),
                         ),

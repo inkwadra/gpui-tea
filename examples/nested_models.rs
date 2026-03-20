@@ -57,7 +57,9 @@ impl NestedModel for CounterChild {
                     .on_click({
                         let dispatcher = dispatcher.clone();
                         move |_event, _window, _cx| {
-                            let _ = dispatcher.dispatch(CounterMsg::Increment);
+                            dispatcher
+                                .dispatch(CounterMsg::Increment)
+                                .expect("the mounted child program should accept increment clicks");
                         }
                     }),
             )

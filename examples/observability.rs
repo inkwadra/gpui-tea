@@ -100,7 +100,9 @@ impl Model for ObservedModel {
                                 .on_click({
                                     let dispatcher = dispatcher.clone();
                                     move |_event, _window, _cx| {
-                                        let _ = dispatcher.dispatch(Msg::RunObservedSequence);
+                                        dispatcher
+                                            .dispatch(Msg::RunObservedSequence)
+                                            .expect("the mounted observed program should accept run requests");
                                     }
                                 }),
                         )
@@ -111,7 +113,9 @@ impl Model for ObservedModel {
                                 .on_click({
                                     let dispatcher = dispatcher.clone();
                                     move |_event, _window, _cx| {
-                                        let _ = dispatcher.dispatch(Msg::Reset);
+                                        dispatcher
+                                            .dispatch(Msg::Reset)
+                                            .expect("the mounted observed program should accept reset requests");
                                     }
                                 }),
                         ),

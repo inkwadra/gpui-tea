@@ -69,7 +69,9 @@ impl Model for BootstrappedCounter {
                                 .on_click({
                                     let dispatcher = dispatcher.clone();
                                     move |_event, _window, _cx| {
-                                        let _ = dispatcher.dispatch(Msg::Increment);
+                                        dispatcher
+                                            .dispatch(Msg::Increment)
+                                            .expect("the mounted counter program should accept increment clicks");
                                     }
                                 }),
                         )
@@ -80,7 +82,9 @@ impl Model for BootstrappedCounter {
                                 .on_click({
                                     let dispatcher = dispatcher.clone();
                                     move |_event, _window, _cx| {
-                                        let _ = dispatcher.dispatch(Msg::Reset);
+                                        dispatcher
+                                            .dispatch(Msg::Reset)
+                                            .expect("the mounted counter program should accept reset clicks");
                                     }
                                 }),
                         ),
