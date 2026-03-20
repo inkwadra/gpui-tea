@@ -6,7 +6,7 @@ use gpui::{App, Entity, TestAppContext, Window, div};
 use gpui_tea::{
     ChildPath, Command, CommandKind, Dispatcher, IntoView, Model, ModelContext, ModelExt,
     NestedModel, Program, ProgramConfig, RuntimeEvent, SubHandle, Subscription, Subscriptions,
-    View,
+    TelemetryEnvelope, View,
 };
 use std::{
     collections::VecDeque,
@@ -624,6 +624,11 @@ fn keyed_effects_are_latest_wins_and_cancel_replaced_tasks(cx: &mut TestAppConte
             emitted_message: bool,
             message_description: Option<String>,
         },
+        Stale {
+            label: Option<String>,
+            emitted_message: bool,
+            message_description: Option<String>,
+        },
     }
 
     struct KeyedModel {
@@ -687,6 +692,16 @@ fn keyed_effects_are_latest_wins_and_cancel_replaced_tasks(cx: &mut TestAppConte
                         emitted_message,
                         message_description: message_description.map(|value| value.to_string()),
                     }),
+                    RuntimeEvent::StaleKeyedCompletionIgnored {
+                        label,
+                        emitted_message,
+                        message_description,
+                        ..
+                    } => Some(KeyedEvent::Stale {
+                        label: label.map(ToOwned::to_owned),
+                        emitted_message,
+                        message_description: message_description.map(|value| value.to_string()),
+                    }),
                     _ => None,
                 };
 
@@ -727,12 +742,13 @@ fn keyed_effects_are_latest_wins_and_cancel_replaced_tasks(cx: &mut TestAppConte
         assert_eq!(program.model().values, vec![2]);
     });
 
+    assert_eq!(first_tx.send(1), Ok(()));
+    cx.run_until_parked();
     cx.executor().forbid_parking();
 
     program.read_with(cx, |program, _cx| {
         assert_eq!(program.model().values, vec![2]);
     });
-    assert_eq!(first_tx.send(1), Err(1));
     assert_eq!(
         events.lock().unwrap().as_slice(),
         &[
@@ -745,6 +761,16 @@ fn keyed_effects_are_latest_wins_and_cancel_replaced_tasks(cx: &mut TestAppConte
                 label: Some(String::from("second")),
                 emitted_message: true,
                 message_description: Some(String::from("loaded:2")),
+            },
+            KeyedEvent::Completed {
+                label: Some(String::from("first")),
+                emitted_message: true,
+                message_description: Some(String::from("loaded:1")),
+            },
+            KeyedEvent::Stale {
+                label: Some(String::from("first")),
+                emitted_message: true,
+                message_description: Some(String::from("loaded:1")),
             },
         ]
     );
@@ -1707,4 +1733,85 @@ fn deep_nested_scope_rebases_grandchild_keys(cx: &mut TestAppContext) {
             Some(String::from("load"))
         )]
     );
+}
+
+#[gpui::test]
+fn telemetry_metadata_uses_stable_program_id_and_monotonic_event_ids(cx: &mut TestAppContext) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Run,
+        Loaded,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct TelemetryRecord {
+        program_id: u64,
+        event_id: u64,
+        queue_depth: usize,
+        program_description: Option<String>,
+    }
+
+    struct TelemetryModel;
+
+    impl Model for TelemetryModel {
+        type Msg = Msg;
+
+        fn update(&mut self, msg: Self::Msg, _cx: &mut App) -> Command<Self::Msg> {
+            match msg {
+                Msg::Run => Command::emit(Msg::Loaded).label("load"),
+                Msg::Loaded => Command::none(),
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let config = ProgramConfig::default()
+        .describe_program(|program_id| format!("program:{program_id}"))
+        .telemetry_observer({
+            let records = records.clone();
+            move |envelope: TelemetryEnvelope<'_, Msg>| {
+                records.lock().unwrap().push(TelemetryRecord {
+                    program_id: envelope.metadata.program_id.get(),
+                    event_id: envelope.metadata.event_id,
+                    queue_depth: envelope.metadata.queue_depth,
+                    program_description: envelope
+                        .metadata
+                        .program_description
+                        .map(|value| value.to_string()),
+                });
+            }
+        });
+
+    let program: Entity<Program<TelemetryModel>> =
+        cx.update(|cx| TelemetryModel.into_program_with(config, cx));
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    dispatcher.dispatch(Msg::Run).unwrap();
+    cx.run_until_parked();
+
+    let records = records.lock().unwrap();
+    assert!(!records.is_empty());
+    let program_id = records[0].program_id;
+    assert!(records.iter().all(|record| record.program_id == program_id));
+    assert!(
+        records
+            .windows(2)
+            .all(|pair| pair[0].event_id < pair[1].event_id)
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.program_description.as_deref()
+                == Some(&format!("program:{program_id}")))
+    );
+    assert!(records.iter().any(|record| record.queue_depth == 0));
 }
