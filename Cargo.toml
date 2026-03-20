@@ -15,6 +15,7 @@ categories = ["development-tools", "gui"]
 [dependencies]
 futures = "0.3.32"
 gpui = { version = "0.2.2", features = ["test-support"] }
+thiserror = "2.0.17"
 
 [lints.rust]
 missing_docs = "warn"
