@@ -374,9 +374,10 @@ impl<Msg> fmt::Debug for Subscriptions<Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ProgramConfig;
+    use crate::{ProgramConfig, QueuePolicy, observability::Observability, runtime::QueueTracker};
     use futures::{FutureExt, StreamExt, channel::mpsc::unbounded};
     use gpui::TestAppContext;
+    use std::sync::Arc;
 
     #[allow(clippy::missing_panics_doc)]
     #[test]
@@ -446,7 +447,15 @@ mod tests {
         }
 
         let (sender, mut receiver) = unbounded();
-        let dispatcher = Dispatcher::new(sender, ProgramConfig::default());
+        let queue_tracker = Arc::new(QueueTracker::new(QueuePolicy::Unbounded));
+        let observability = Observability::new(
+            ProgramConfig::default(),
+            Arc::new({
+                let queue_tracker = queue_tracker.clone();
+                move || queue_tracker.depth()
+            }),
+        );
+        let dispatcher = Dispatcher::new(sender, queue_tracker, observability);
         let mapped = Subscription::new("mapped", |cx| {
             cx.dispatch(InnerMsg::Fire("payload"))
                 .expect("the mapped dispatcher should be alive while building the subscription");
@@ -467,7 +476,11 @@ mod tests {
         });
 
         cx.run_until_parked();
-        let message = receiver.next().now_or_never().flatten();
+        let message = receiver
+            .next()
+            .now_or_never()
+            .flatten()
+            .map(|queued| queued.message);
         assert_eq!(message, Some(OuterMsg::Wrapped("payload")));
     }
 }

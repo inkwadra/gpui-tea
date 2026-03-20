@@ -1,6 +1,7 @@
 use crate::{
     Error, Result,
-    observability::{ProgramConfig, RuntimeEvent},
+    observability::{Observability, QueueOverflowAction, RuntimeEvent, TelemetryEvent},
+    runtime::{QueueReservation, QueueTracker, QueuedMessage},
 };
 use futures::channel::mpsc::UnboundedSender;
 use std::fmt;
@@ -20,24 +21,71 @@ pub struct Dispatcher<Msg> {
 }
 
 impl<Msg: Send + 'static> Dispatcher<Msg> {
-    pub(crate) fn new(sender: UnboundedSender<Msg>, config: ProgramConfig<Msg>) -> Self {
+    pub(crate) fn new(
+        sender: UnboundedSender<QueuedMessage<Msg>>,
+        queue_tracker: Arc<QueueTracker>,
+        observability: Observability<Msg>,
+    ) -> Self {
         Self {
             dispatch: Arc::new(move |msg: Msg| {
-                let message_description = config.describe_message_value(&msg);
-                let result = sender
-                    .unbounded_send(msg)
-                    .map_err(|_| Error::ProgramUnavailable);
+                let message_description = observability.describe_message_value(&msg);
+                let reservation = queue_tracker.reserve_enqueue();
 
-                match &result {
-                    Ok(()) => config.observe(RuntimeEvent::DispatchAccepted {
-                        message_description,
-                    }),
-                    Err(_) => config.observe(RuntimeEvent::DispatchRejected {
-                        message_description,
-                    }),
+                match reservation {
+                    QueueReservation::Rejected => {
+                        observability.observe_telemetry(TelemetryEvent::QueueOverflow {
+                            policy: observability.queue_policy(),
+                            action: QueueOverflowAction::RejectedNew,
+                            message_description,
+                        });
+                        Err(Error::QueueFull {
+                            policy: observability.queue_policy(),
+                        })
+                    }
+                    QueueReservation::DroppedNewest => {
+                        observability.observe_telemetry(TelemetryEvent::QueueOverflow {
+                            policy: observability.queue_policy(),
+                            action: QueueOverflowAction::DroppedNewest,
+                            message_description,
+                        });
+                        Ok(())
+                    }
+                    accepted @ QueueReservation::Accepted {
+                        id,
+                        overflow_action,
+                        ..
+                    } => {
+                        let result = sender
+                            .unbounded_send(QueuedMessage { id, message: msg })
+                            .map_err(|_| Error::ProgramUnavailable);
+
+                        if let Ok(()) = &result {
+                            if let Some(action) = overflow_action {
+                                observability.observe_telemetry(TelemetryEvent::QueueOverflow {
+                                    policy: observability.queue_policy(),
+                                    action,
+                                    message_description: message_description.clone(),
+                                });
+                            }
+                            observability.observe_runtime(RuntimeEvent::DispatchAccepted {
+                                message_description: message_description.clone(),
+                            });
+                            observability.observe_telemetry(TelemetryEvent::DispatchAccepted {
+                                message_description,
+                            });
+                        } else {
+                            queue_tracker.rollback_enqueue(accepted);
+                            observability.observe_runtime(RuntimeEvent::DispatchRejected {
+                                message_description: message_description.clone(),
+                            });
+                            observability.observe_telemetry(TelemetryEvent::DispatchRejected {
+                                message_description,
+                            });
+                        }
+
+                        result
+                    }
                 }
-
-                result
             }),
         }
     }
@@ -52,6 +100,9 @@ impl<Msg: Send + 'static> Dispatcher<Msg> {
     ///
     /// Returns [`Error::ProgramUnavailable`] when the target program has
     /// already been released and can no longer accept messages.
+    ///
+    /// Returns [`Error::QueueFull`] when the configured queue policy rejects
+    /// new messages.
     pub fn dispatch(&self, msg: Msg) -> Result<()> {
         (self.dispatch)(msg)
     }
@@ -61,27 +112,6 @@ impl<Msg: Send + 'static> Dispatcher<Msg> {
     ///
     /// This is useful when a subview wants to work with a narrower message type
     /// while the outer program still expects the model's full message enum.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use gpui_tea::Dispatcher;
-    ///
-    /// enum ParentMsg {
-    ///     Child(u32),
-    /// }
-    ///
-    /// enum ChildMsg {
-    ///     Clicked,
-    /// }
-    ///
-    /// fn map_dispatcher(dispatcher: &Dispatcher<ParentMsg>) {
-    ///     let child = dispatcher.map(|msg| match msg {
-    ///         ChildMsg::Clicked => ParentMsg::Child(1),
-    ///     });
-    ///     let _ = child;
-    /// }
-    /// ```
     pub fn map<F, NewMsg>(&self, f: F) -> Dispatcher<NewMsg>
     where
         F: Fn(NewMsg) -> Msg + Clone + Send + Sync + 'static,
@@ -112,7 +142,10 @@ impl<Msg> fmt::Debug for Dispatcher<Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observability::RuntimeEvent;
+    use crate::{
+        observability::{ProgramConfig, QueuePolicy},
+        runtime::QueueTracker,
+    };
     use futures::channel::mpsc::unbounded;
     use std::sync::{Arc, Mutex};
 
@@ -125,6 +158,7 @@ mod tests {
     enum DispatchEvent {
         Accepted(Option<String>),
         Rejected(Option<String>),
+        Overflow(String),
     }
 
     #[allow(clippy::missing_panics_doc)]
@@ -137,7 +171,7 @@ mod tests {
             })
             .observer({
                 let dispatch_events = dispatch_events.clone();
-                move |event: RuntimeEvent<'_, Msg>| match event {
+                move |event| match event {
                     RuntimeEvent::DispatchAccepted {
                         message_description,
                     } => dispatch_events
@@ -156,10 +190,36 @@ mod tests {
                         )),
                     _ => {}
                 }
+            })
+            .telemetry_observer({
+                let dispatch_events = dispatch_events.clone();
+                move |event| {
+                    if let TelemetryEvent::QueueOverflow {
+                        message_description,
+                        ..
+                    } = event.event
+                    {
+                        dispatch_events
+                            .lock()
+                            .unwrap()
+                            .push(DispatchEvent::Overflow(message_description.map_or_else(
+                                || String::from("<none>"),
+                                |value| value.to_string(),
+                            )));
+                    }
+                }
             });
 
+        let queue_tracker = Arc::new(QueueTracker::new(QueuePolicy::Unbounded));
+        let observability = Observability::new(
+            config,
+            Arc::new({
+                let queue_tracker = queue_tracker.clone();
+                move || queue_tracker.depth()
+            }),
+        );
         let (sender, receiver) = unbounded();
-        let dispatcher = Dispatcher::new(sender, config);
+        let dispatcher = Dispatcher::new(sender, queue_tracker, observability);
 
         assert_eq!(dispatcher.dispatch(Msg::Set(1)), Ok(()));
         drop(receiver);
@@ -173,6 +233,31 @@ mod tests {
                 DispatchEvent::Accepted(Some(String::from("set:1"))),
                 DispatchEvent::Rejected(Some(String::from("set:2"))),
             ]
+        );
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    #[test]
+    fn dispatch_returns_queue_full_when_policy_rejects_new_messages() {
+        let config =
+            ProgramConfig::<Msg>::default().queue_policy(QueuePolicy::RejectNew { capacity: 0 });
+        let queue_tracker = Arc::new(QueueTracker::new(QueuePolicy::RejectNew { capacity: 0 }));
+        let observability = Observability::new(
+            config,
+            Arc::new({
+                let queue_tracker = queue_tracker.clone();
+                move || queue_tracker.depth()
+            }),
+        );
+        let (sender, _receiver) = unbounded();
+        let dispatcher = Dispatcher::new(sender, queue_tracker, observability);
+
+        let error = dispatcher.dispatch(Msg::Set(7)).unwrap_err();
+        assert_eq!(
+            error,
+            Error::QueueFull {
+                policy: QueuePolicy::RejectNew { capacity: 0 },
+            }
         );
     }
 }
