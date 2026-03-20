@@ -1,0 +1,5 @@
+error: unsupported `composite` attribute
+  --> tests/ui/unsupported_composite_attr.rs:18:28
+   |
+18 | #[composite(message = Msg, mode = "strict")]
+   |                            ^^^^

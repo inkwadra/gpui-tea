@@ -1,0 +1,5 @@
+error: unsupported `child` attribute
+  --> tests/ui/unsupported_child_attr.rs:20:75
+   |
+20 |     #[child(path = "child", lift = Msg::Child, extract = Msg::into_child, mode = "strict")]
+   |                                                                           ^^^^

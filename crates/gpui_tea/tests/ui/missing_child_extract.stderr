@@ -1,0 +1,5 @@
+error: missing `extract`
+  --> tests/ui/missing_child_extract.rs:10:5
+   |
+10 |     #[child(path = "child", lift = Msg::Child)]
+   |     ^

@@ -1,0 +1,5 @@
+error: duplicate `message` attribute
+  --> tests/ui/duplicate_message.rs:18:28
+   |
+18 | #[composite(message = Msg, message = Msg)]
+   |                            ^^^^^^^

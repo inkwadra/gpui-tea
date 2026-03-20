@@ -1,0 +1,5 @@
+error: duplicate `lift` attribute
+  --> tests/ui/duplicate_child_lift.rs:23:9
+   |
+23 |         lift = Msg::Child,
+   |         ^^^^

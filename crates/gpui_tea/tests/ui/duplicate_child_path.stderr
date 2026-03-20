@@ -1,0 +1,5 @@
+error: duplicate `path` attribute
+  --> tests/ui/duplicate_child_path.rs:22:9
+   |
+22 |         path = "second",
+   |         ^^^^

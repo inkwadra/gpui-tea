@@ -1,0 +1,28 @@
+[package]
+name = "gpui_tea_macros"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = ["crates-io"]
+categories.workspace = true
+description = "Procedural macros for gpui_tea."
+keywords = ["gpui", "ui", "tea", "proc-macro"]
+include = ["src/**", "Cargo.toml", "../../LICENSE"]
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
+
+[lints]
+workspace = true

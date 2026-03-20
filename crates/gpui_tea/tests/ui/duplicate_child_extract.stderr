@@ -1,0 +1,5 @@
+error: duplicate `extract` attribute
+  --> tests/ui/duplicate_child_extract.rs:24:9
+   |
+24 |         extract = Msg::into_child
+   |         ^^^^^^^
