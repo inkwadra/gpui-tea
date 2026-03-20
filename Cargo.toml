@@ -12,10 +12,18 @@ documentation = "https://docs.rs/gpui_tea"
 keywords = ["gpui", "ui", "tea"]
 categories = ["development-tools", "gui"]
 
+[features]
+default = []
+metrics = ["dep:metrics"]
+tracing = ["dep:tracing", "dep:tracing-subscriber"]
+
 [dependencies]
 futures = "0.3.32"
 gpui = { version = "0.2.2", features = ["test-support"] }
+metrics = { version = "0.24.2", optional = true }
 thiserror = "2.0.17"
+tracing = { version = "0.1.41", optional = true }
+tracing-subscriber = { version = "0.3.19", optional = true, features = ["env-filter"] }
 
 [lints.rust]
 missing_docs = "warn"
