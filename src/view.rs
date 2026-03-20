@@ -1,27 +1,26 @@
 use gpui::{AnyElement, Empty, IntoElement};
+use std::fmt;
 
 /// Render value returned by [`crate::Model::view`].
 ///
 /// `View` is an owned, GPUI-first wrapper around [`gpui::AnyElement`]. It
 /// exists to give `gpui_tea` a narrow render boundary without introducing a
 /// second rendering model or lifecycle.
+#[must_use]
 pub struct View(AnyElement);
 
 impl View {
     /// Wrap any GPUI element-like value as a `View`.
-    #[must_use]
     pub fn new(element: impl IntoElement) -> Self {
         Self(element.into_any_element())
     }
 
     /// Wrap an existing [`gpui::AnyElement`] as a `View`.
-    #[must_use]
     pub fn from_any_element(element: AnyElement) -> Self {
         Self(element)
     }
 
     /// Create an empty view that renders nothing.
-    #[must_use]
     pub fn empty() -> Self {
         Self(Empty.into_any_element())
     }
@@ -60,6 +59,12 @@ impl From<AnyElement> for View {
 impl From<View> for AnyElement {
     fn from(view: View) -> Self {
         view.into_any_element()
+    }
+}
+
+impl fmt::Debug for View {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("View").field(&"..").finish()
     }
 }
 

@@ -1,9 +1,12 @@
 use crate::command::{CommandInner, Effect};
 use crate::observability::{ProgramConfig, RuntimeEvent};
 use crate::runtime::{CommandMeta, KeyedEffectContext, Runtime};
-use crate::{Command, CommandKind, Dispatcher, Key, Subscriptions, View};
+use crate::{
+    Command, CommandKind, Dispatcher, Key, ModelContext, NestedModel, Subscriptions, View,
+};
 use futures::StreamExt;
 use gpui::{App, AppContext, AsyncApp, Context, Entity, IntoElement, Render, Task, Window};
+use std::fmt;
 
 /// Define the application state and transition contract for a [`Program`].
 ///
@@ -46,16 +49,63 @@ pub trait Model: Sized + 'static {
     }
 }
 
+impl<T: Model> NestedModel for T {
+    type Msg = T::Msg;
+
+    fn init(&mut self, cx: &mut App, _scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+        Model::init(self, cx)
+    }
+
+    fn update(
+        &mut self,
+        msg: Self::Msg,
+        cx: &mut App,
+        _scope: &ModelContext<Self::Msg>,
+    ) -> Command<Self::Msg> {
+        Model::update(self, msg, cx)
+    }
+
+    fn view(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+        _scope: &ModelContext<Self::Msg>,
+        dispatcher: &Dispatcher<Self::Msg>,
+    ) -> View {
+        Model::view(self, window, cx, dispatcher)
+    }
+
+    fn subscriptions(
+        &self,
+        cx: &mut App,
+        _scope: &ModelContext<Self::Msg>,
+    ) -> Subscriptions<Self::Msg> {
+        Model::subscriptions(self, cx)
+    }
+}
+
 /// Host a [`Model`] inside a GPUI entity and drive the TEA runtime.
 ///
 /// A program owns the model, message queue, keyed task tracking, subscription
 /// registry, and runtime configuration for a single mounted instance.
-pub struct Program<M: Model> {
+pub struct Program<M: NestedModel> {
     model: M,
     runtime: Runtime<M::Msg>,
 }
 
-impl<M: Model> Program<M> {
+impl<M> fmt::Debug for Program<M>
+where
+    M: NestedModel + fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Program")
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M: NestedModel> Program<M> {
     fn build_runtime(config: ProgramConfig<M::Msg>, cx: &mut Context<'_, Self>) -> Runtime<M::Msg> {
         let (sender, mut receiver) = futures::channel::mpsc::unbounded();
         let dispatcher = Dispatcher::new(sender, config.clone());
@@ -151,7 +201,7 @@ impl<M: Model> Program<M> {
         cx.new(|cx| {
             let runtime = Self::build_runtime(config, cx);
             let mut program = Self { model, runtime };
-            let init_command = program.model.init(cx);
+            let init_command = program.model.init(cx, &ModelContext::root());
             program.execute_command(init_command, cx);
             program.reconcile_subscriptions(cx);
             program
@@ -210,7 +260,7 @@ impl<M: Model> Program<M> {
                 message_description,
             });
 
-            let command = self.model.update(message, cx);
+            let command = self.model.update(message, cx, &ModelContext::root());
             processed += 1;
             self.execute_command(command, cx);
         }
@@ -387,7 +437,7 @@ impl<M: Model> Program<M> {
     }
 
     fn reconcile_subscriptions(&mut self, cx: &mut Context<'_, Self>) {
-        let subscriptions = self.model.subscriptions(cx);
+        let subscriptions = self.model.subscriptions(cx, &ModelContext::root());
         let dispatcher = self.dispatcher();
         let stats = self.runtime.subscriptions.reconcile(
             subscriptions,
@@ -407,15 +457,16 @@ impl<M: Model> Program<M> {
     }
 }
 
-impl<M: Model> Render for Program<M> {
+impl<M: NestedModel> Render for Program<M> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let dispatcher = self.dispatcher();
-        self.model.view(window, cx, &dispatcher)
+        self.model
+            .view(window, cx, &ModelContext::root(), &dispatcher)
     }
 }
 
 /// Mount a [`Model`] as a fully initialized [`Program`].
-pub trait ModelExt: Model {
+pub trait ModelExt: NestedModel {
     /// Mount this model as a fully initialized program entity.
     ///
     /// This is a convenience wrapper around [`Program::mount`].
@@ -435,7 +486,7 @@ pub trait ModelExt: Model {
     }
 }
 
-impl<M: Model> ModelExt for M {}
+impl<M: NestedModel> ModelExt for M {}
 
 #[cfg(test)]
 mod runtime_tests {

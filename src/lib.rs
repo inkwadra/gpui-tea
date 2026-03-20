@@ -32,7 +32,8 @@
 //!   completes after being replaced, its completion is ignored as stale.
 //! - Subscription identity is key-based. Reusing a key reuses the existing
 //!   handle, and changing a key rebuilds the subscription.
-//! - Dispatching after the program is released fails with `DispatchError`.
+//! - Dispatching after the program is released fails with
+//!   [`Error::ProgramUnavailable`].
 //!
 //! ## Examples
 //!
@@ -182,7 +183,8 @@
 //!         };
 //!
 //!         Subscriptions::one(Subscription::new(key, move |cx| {
-//!             cx.dispatch(Msg::FromSubscription(key)).unwrap();
+//!             cx.dispatch(Msg::FromSubscription(key))
+//!                 .expect("the mounted program is alive while the subscription is being built");
 //!             SubHandle::None
 //!         }))
 //!     }
@@ -249,6 +251,8 @@
 
 mod command;
 mod dispatcher;
+mod error;
+mod nested;
 mod observability;
 mod program;
 mod runtime;
@@ -256,10 +260,10 @@ mod subscription;
 mod view;
 
 pub use command::{Command, CommandKind, Key};
-pub use dispatcher::{DispatchError, Dispatcher};
-pub use observability::{ProgramConfig, RuntimeEvent, RuntimeObserver};
+pub use dispatcher::Dispatcher;
+pub use error::{Error, Result};
+pub use nested::{ChildPath, ChildScope, ModelContext, NestedModel};
+pub use observability::{ProgramConfig, RuntimeEvent};
 pub use program::{Model, ModelExt, Program};
-pub use subscription::{
-    SubHandle, Subscription, SubscriptionBuilder, SubscriptionContext, Subscriptions,
-};
+pub use subscription::{SubHandle, Subscription, SubscriptionContext, Subscriptions};
 pub use view::{IntoView, View};

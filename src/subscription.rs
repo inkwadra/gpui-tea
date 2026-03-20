@@ -1,6 +1,6 @@
-use crate::{DispatchError, Dispatcher, Key};
+use crate::{ChildPath, Dispatcher, Error, Key, Result};
 use gpui::App;
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, fmt, sync::Arc};
 
 /// Hold the runtime resource associated with an active subscription.
 ///
@@ -20,15 +20,32 @@ pub enum SubHandle {
     None,
 }
 
+impl fmt::Debug for SubHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Subscription(_) => formatter
+                .debug_tuple("SubHandle::Subscription")
+                .field(&"..")
+                .finish(),
+            Self::Task(_) => formatter
+                .debug_tuple("SubHandle::Task")
+                .field(&"..")
+                .finish(),
+            Self::None => formatter.write_str("SubHandle::None"),
+        }
+    }
+}
+
 /// Build the [`SubHandle`] for a newly activated [`Subscription`].
 ///
 /// The runtime calls this builder only when a subscription key is newly added
 /// during reconciliation. Reusing the same key on a later render keeps the
 /// previous handle instead of invoking the builder again.
-pub type SubscriptionBuilder<Msg> =
+type SubscriptionBuilder<Msg> =
     Box<dyn for<'a> FnOnce(&'a mut SubscriptionContext<'a, Msg>) -> SubHandle>;
 
 /// Provide runtime access while building a [`Subscription`].
+#[must_use]
 pub struct SubscriptionContext<'a, Msg> {
     app: &'a mut App,
     dispatcher: Dispatcher<Msg>,
@@ -57,10 +74,18 @@ impl<'a, Msg: Send + 'static> SubscriptionContext<'a, Msg> {
     ///
     /// # Errors
     ///
-    /// Returns [`DispatchError`] when the associated program has already been
-    /// released and can no longer accept messages.
-    pub fn dispatch(&self, msg: Msg) -> Result<(), DispatchError> {
+    /// Returns [`Error::ProgramUnavailable`] when the associated program has
+    /// already been released and can no longer accept messages.
+    pub fn dispatch(&self, msg: Msg) -> Result<()> {
         self.dispatcher.dispatch(msg)
+    }
+}
+
+impl<Msg> fmt::Debug for SubscriptionContext<'_, Msg> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubscriptionContext")
+            .finish_non_exhaustive()
     }
 }
 
@@ -69,6 +94,7 @@ impl<'a, Msg: Send + 'static> SubscriptionContext<'a, Msg> {
 /// The key is the full identity of the subscription. If any captured state or
 /// behavior changes, the subscription must use a different key so the runtime
 /// can rebuild it.
+#[must_use]
 pub struct Subscription<Msg: 'static> {
     pub(crate) key: Key,
     pub(crate) label: Option<Arc<str>>,
@@ -109,7 +135,6 @@ impl<Msg: Send + 'static> Subscription<Msg> {
     ///
     /// Re-declaring the same key with a different label updates the observed
     /// label without forcing the runtime to rebuild the underlying handle.
-    #[must_use]
     pub fn label(mut self, label: impl Into<Arc<str>>) -> Self {
         self.label = Some(label.into());
         self
@@ -145,15 +170,55 @@ impl<Msg: Send + 'static> Subscription<Msg> {
             }),
         }
     }
+
+    /// Rebase this subscription into a nested child path.
+    pub fn scoped(mut self, path: &ChildPath) -> Self {
+        if !path.is_root() {
+            self.key = self.key.scoped(path);
+        }
+        self
+    }
+}
+
+impl<Msg> fmt::Debug for Subscription<Msg> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Subscription")
+            .field("key", &self.key)
+            .field("label", &self.label.as_deref())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Hold a validated collection of subscriptions with unique keys.
+#[must_use]
 pub struct Subscriptions<Msg: 'static> {
     subscriptions: Vec<Subscription<Msg>>,
     keys: HashSet<Key>,
 }
 
 impl<Msg: Send + 'static> Subscriptions<Msg> {
+    fn from_unique_iter(subscriptions: impl IntoIterator<Item = Subscription<Msg>>) -> Self {
+        let subscriptions: Vec<_> = subscriptions.into_iter().collect();
+        let keys = subscriptions
+            .iter()
+            .map(|subscription| subscription.key.clone())
+            .collect();
+        Self {
+            subscriptions,
+            keys,
+        }
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    fn try_insert_key(&mut self, key: &Key) -> Result<()> {
+        if self.keys.insert(key.clone()) {
+            return Ok(());
+        }
+
+        Err(Error::DuplicateSubscriptionKey { key: key.clone() })
+    }
+
     /// Create an empty subscription set.
     ///
     /// # Examples
@@ -164,7 +229,6 @@ impl<Msg: Send + 'static> Subscriptions<Msg> {
     /// let subscriptions = Subscriptions::<()>::none();
     /// assert!(subscriptions.is_empty());
     /// ```
-    #[must_use]
     pub fn none() -> Self {
         Self {
             subscriptions: Vec::new(),
@@ -184,42 +248,34 @@ impl<Msg: Send + 'static> Subscriptions<Msg> {
     ///
     /// assert_eq!(subscriptions.len(), 1);
     /// ```
-    #[must_use]
     pub fn one(subscription: Subscription<Msg>) -> Self {
-        let mut subscriptions = Self::none();
-        subscriptions.push(subscription);
-        subscriptions
+        Self::from_unique_iter([subscription])
     }
 
     /// Build a subscription set from an iterator of subscriptions.
     ///
-    /// Duplicate keys are treated as a programmer error and will panic.
+    /// # Errors
     ///
-    /// # Panics
-    ///
-    /// Panics if two subscriptions in the iterator share the same key.
-    pub fn batch(subscriptions: impl IntoIterator<Item = Subscription<Msg>>) -> Self {
+    /// Returns [`Error::DuplicateSubscriptionKey`] if two subscriptions in the
+    /// iterator share the same key.
+    pub fn batch(subscriptions: impl IntoIterator<Item = Subscription<Msg>>) -> Result<Self> {
         let mut result = Self::none();
         for subscription in subscriptions {
-            result.push(subscription);
+            result.push(subscription)?;
         }
-        result
+        Ok(result)
     }
 
     /// Append a subscription to the set.
     ///
-    /// Duplicate keys are treated as a programmer error and will panic.
+    /// # Errors
     ///
-    /// # Panics
-    ///
-    /// Panics if `subscription.key` is already present in the set.
-    pub fn push(&mut self, subscription: Subscription<Msg>) {
-        assert!(
-            self.keys.insert(subscription.key.clone()),
-            "duplicate subscription key declared while building subscriptions: {:?}",
-            subscription.key
-        );
+    /// Returns [`Error::DuplicateSubscriptionKey`] if `subscription.key` is
+    /// already present in the set.
+    pub fn push(&mut self, subscription: Subscription<Msg>) -> Result<()> {
+        self.try_insert_key(&subscription.key)?;
         self.subscriptions.push(subscription);
+        Ok(())
     }
 
     /// Transform the messages dispatched by every subscription in the set.
@@ -244,10 +300,23 @@ impl<Msg: Send + 'static> Subscriptions<Msg> {
         F: Fn(Msg) -> NewMsg + Clone + Send + Sync + 'static,
         NewMsg: Send + 'static,
     {
-        Subscriptions::batch(
+        Subscriptions::from_unique_iter(
             self.subscriptions
                 .into_iter()
                 .map(|subscription| subscription.map(f.clone())),
+        )
+    }
+
+    /// Rebase all subscription keys into a nested child path.
+    pub fn scoped(self, path: &ChildPath) -> Self {
+        if path.is_root() {
+            return self;
+        }
+
+        Subscriptions::from_unique_iter(
+            self.subscriptions
+                .into_iter()
+                .map(|subscription| subscription.scoped(path)),
         )
     }
 
@@ -270,22 +339,6 @@ impl<Msg: Send + 'static> Default for Subscriptions<Msg> {
     }
 }
 
-impl<Msg: Send + 'static> Extend<Subscription<Msg>> for Subscriptions<Msg> {
-    fn extend<T: IntoIterator<Item = Subscription<Msg>>>(&mut self, iter: T) {
-        for subscription in iter {
-            self.push(subscription);
-        }
-    }
-}
-
-impl<Msg: Send + 'static> FromIterator<Subscription<Msg>> for Subscriptions<Msg> {
-    fn from_iter<T: IntoIterator<Item = Subscription<Msg>>>(iter: T) -> Self {
-        let mut subscriptions = Self::none();
-        subscriptions.extend(iter);
-        subscriptions
-    }
-}
-
 impl<Msg: Send + 'static> From<Subscription<Msg>> for Subscriptions<Msg> {
     fn from(subscription: Subscription<Msg>) -> Self {
         Self::one(subscription)
@@ -301,6 +354,23 @@ impl<Msg: Send + 'static> IntoIterator for Subscriptions<Msg> {
     }
 }
 
+impl<Msg> fmt::Debug for Subscriptions<Msg> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut keys = self
+            .keys
+            .iter()
+            .map(|key| format!("{key:?}"))
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+
+        formatter
+            .debug_struct("Subscriptions")
+            .field("len", &self.subscriptions.len())
+            .field("keys", &keys)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,35 +378,49 @@ mod tests {
     use futures::{FutureExt, StreamExt, channel::mpsc::unbounded};
     use gpui::TestAppContext;
 
+    #[allow(clippy::missing_panics_doc)]
     #[test]
-    #[should_panic(
-        expected = "duplicate subscription key declared while building subscriptions: Key(\"dup\")"
-    )]
-    fn batch_panics_on_duplicate_keys() {
-        let _ = Subscriptions::<()>::batch([
+    fn batch_returns_duplicate_key_error() {
+        let error = Subscriptions::<()>::batch([
             Subscription::<()>::new("dup", |_| SubHandle::None),
             Subscription::<()>::new("dup", |_| SubHandle::None),
-        ]);
-    }
+        ])
+        .unwrap_err();
 
-    #[test]
-    #[should_panic(
-        expected = "duplicate subscription key declared while building subscriptions: Key(\"dup\")"
-    )]
-    fn push_panics_on_duplicate_keys() {
-        let mut subscriptions =
-            Subscriptions::one(Subscription::<()>::new("dup", |_| SubHandle::None));
-        subscriptions.push(Subscription::<()>::new("dup", |_| SubHandle::None));
+        assert_eq!(
+            error,
+            Error::DuplicateSubscriptionKey {
+                key: Key::new("dup"),
+            }
+        );
     }
 
     #[allow(clippy::missing_panics_doc)]
     #[test]
-    fn from_iter_and_extend_preserve_uniqueness_and_order() {
-        let mut subscriptions: Subscriptions<()> =
-            [Subscription::new("alpha", |_| SubHandle::None)]
-                .into_iter()
-                .collect();
-        subscriptions.extend([Subscription::new("beta", |_| SubHandle::None)]);
+    fn push_returns_duplicate_key_error() {
+        let mut subscriptions =
+            Subscriptions::one(Subscription::<()>::new("dup", |_| SubHandle::None));
+        let error = subscriptions
+            .push(Subscription::<()>::new("dup", |_| SubHandle::None))
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            Error::DuplicateSubscriptionKey {
+                key: Key::new("dup"),
+            }
+        );
+    }
+
+    #[allow(clippy::missing_panics_doc)]
+    #[test]
+    fn batch_and_push_preserve_uniqueness_and_order() {
+        let mut subscriptions =
+            Subscriptions::<()>::batch([Subscription::new("alpha", |_| SubHandle::None)])
+                .expect("unique keys should build a subscription set");
+        subscriptions
+            .push(Subscription::new("beta", |_| SubHandle::None))
+            .expect("a new key should append successfully");
 
         let keys = subscriptions
             .into_iter()
@@ -364,7 +448,8 @@ mod tests {
         let (sender, mut receiver) = unbounded();
         let dispatcher = Dispatcher::new(sender, ProgramConfig::default());
         let mapped = Subscription::new("mapped", |cx| {
-            cx.dispatch(InnerMsg::Fire("payload")).unwrap();
+            cx.dispatch(InnerMsg::Fire("payload"))
+                .expect("the mapped dispatcher should be alive while building the subscription");
             SubHandle::None
         })
         .label("mapped-subscription")

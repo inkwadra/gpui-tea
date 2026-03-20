@@ -1,9 +1,10 @@
+use crate::ChildPath;
 use futures::{
     FutureExt,
     future::{BoxFuture, LocalBoxFuture},
 };
 use gpui::{AsyncApp, BackgroundExecutor};
-use std::{future::Future, sync::Arc};
+use std::{fmt, future::Future, sync::Arc};
 
 pub(crate) type ForegroundEffectFn<Msg> =
     Box<dyn for<'a> FnOnce(&'a mut AsyncApp) -> LocalBoxFuture<'a, Option<Msg>> + 'static>;
@@ -55,8 +56,12 @@ pub(crate) enum CommandInner<Msg> {
 /// completion from earlier work with the same key is ignored. Reusing the same
 /// key for a [`crate::Subscription`] keeps the existing subscription handle
 /// alive instead of rebuilding it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Key(Arc<str>);
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Key {
+    id: Arc<str>,
+    child_path: Option<ChildPath>,
+    local_id: Option<Arc<str>>,
+}
 
 impl Key {
     /// Create a key from a stable identifier.
@@ -75,13 +80,64 @@ impl Key {
     /// assert_eq!(first, second);
     /// ```
     pub fn new(id: impl Into<Arc<str>>) -> Self {
-        Self(id.into())
+        Self {
+            id: id.into(),
+            child_path: None,
+            local_id: None,
+        }
+    }
+
+    /// Return the runtime identity used to track this key.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Return the nested child path associated with this key, if any.
+    #[must_use]
+    pub fn child_path(&self) -> Option<&ChildPath> {
+        self.child_path.as_ref()
+    }
+
+    /// Return the child-local key identifier before path rebasing, if any.
+    #[must_use]
+    pub fn local_id(&self) -> Option<&str> {
+        self.local_id.as_deref()
+    }
+
+    pub(crate) fn scoped(&self, path: &ChildPath) -> Self {
+        if path.is_root() || self.child_path.is_some() {
+            return self.clone();
+        }
+
+        let local_id: Arc<str> = Arc::from(self.id());
+        let mut runtime_id = String::from(path.runtime_prefix().as_ref());
+        runtime_id.push('#');
+        runtime_id.push_str(&local_id.len().to_string());
+        runtime_id.push(':');
+        runtime_id.push_str(local_id.as_ref());
+
+        Self {
+            id: Arc::from(runtime_id),
+            child_path: Some(path.clone()),
+            local_id: Some(local_id),
+        }
     }
 }
 
 impl<T: Into<Arc<str>>> From<T> for Key {
     fn from(id: T) -> Self {
         Self::new(id)
+    }
+}
+
+impl fmt::Debug for Key {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let (Some(path), Some(local_id)) = (&self.child_path, &self.local_id) {
+            return write!(formatter, "Key(\"{path}:{local_id}\")");
+        }
+
+        write!(formatter, "Key(\"{}\")", self.id)
     }
 }
 
@@ -94,6 +150,7 @@ impl<T: Into<Arc<str>>> From<T> for Key {
 ///
 /// Attach a label with [`Command::label`] when runtime observability should
 /// report human-readable command names.
+#[must_use]
 pub struct Command<Msg> {
     pub(crate) inner: CommandInner<Msg>,
     pub(crate) label: Option<Arc<str>>,
@@ -288,7 +345,6 @@ impl<Msg: Send + 'static> Command<Msg> {
     /// The runtime includes this label in [`crate::RuntimeEvent`] values such as
     /// [`crate::RuntimeEvent::CommandScheduled`] and
     /// [`crate::RuntimeEvent::EffectCompleted`].
-    #[must_use]
     pub fn label(mut self, label: impl Into<Arc<str>>) -> Self {
         self.label = Some(label.into());
         self
@@ -377,6 +433,49 @@ impl<Msg: Send + 'static> Command<Msg> {
         }
     }
 
+    /// Rebase keyed identities into a nested child path.
+    ///
+    /// Non-keyed commands are unchanged. Keyed commands keep their local key
+    /// metadata while becoming unique within the provided path.
+    pub fn scoped(self, path: &ChildPath) -> Self {
+        if path.is_root() {
+            return self;
+        }
+
+        let label = self.label;
+
+        match self.inner {
+            CommandInner::None => Command {
+                inner: CommandInner::None,
+                label,
+            },
+            CommandInner::Emit(message) => Command {
+                inner: CommandInner::Emit(message),
+                label,
+            },
+            CommandInner::Effect(effect) => Command {
+                inner: CommandInner::Effect(effect),
+                label,
+            },
+            CommandInner::Batch(commands) => Command {
+                inner: CommandInner::Batch(
+                    commands
+                        .into_iter()
+                        .map(|command| command.scoped(path))
+                        .collect(),
+                ),
+                label,
+            },
+            CommandInner::Keyed { key, effect } => Command {
+                inner: CommandInner::Keyed {
+                    key: key.scoped(path),
+                    effect,
+                },
+                label,
+            },
+        }
+    }
+
     pub(crate) fn into_parts(self) -> (Option<Arc<str>>, CommandInner<Msg>) {
         (self.label, self.inner)
     }
@@ -401,6 +500,47 @@ where
             let mapper = f.clone();
             async move { future.await.map(mapper) }.boxed()
         })),
+    }
+}
+
+impl<Msg> fmt::Debug for Command<Msg> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("Command");
+        debug.field("variant", &command_variant(&self.inner));
+        debug.field("execution_kind", &command_execution_kind(&self.inner));
+        debug.field("label", &self.label.as_deref());
+        debug.field("key", &command_key(&self.inner));
+        if let CommandInner::Batch(commands) = &self.inner {
+            debug.field("batch_len", &commands.len());
+        }
+        debug.finish_non_exhaustive()
+    }
+}
+
+fn command_variant<Msg>(inner: &CommandInner<Msg>) -> &'static str {
+    match inner {
+        CommandInner::None => "None",
+        CommandInner::Emit(_) => "Emit",
+        CommandInner::Batch(_) => "Batch",
+        CommandInner::Effect(_) => "Effect",
+        CommandInner::Keyed { .. } => "Keyed",
+    }
+}
+
+fn command_execution_kind<Msg>(inner: &CommandInner<Msg>) -> Option<CommandKind> {
+    match inner {
+        CommandInner::Effect(effect) | CommandInner::Keyed { effect, .. } => Some(effect.kind()),
+        CommandInner::None | CommandInner::Emit(_) | CommandInner::Batch(_) => None,
+    }
+}
+
+fn command_key<Msg>(inner: &CommandInner<Msg>) -> Option<&Key> {
+    match inner {
+        CommandInner::Keyed { key, .. } => Some(key),
+        CommandInner::None
+        | CommandInner::Emit(_)
+        | CommandInner::Batch(_)
+        | CommandInner::Effect(_) => None,
     }
 }
 

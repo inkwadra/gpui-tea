@@ -1,33 +1,12 @@
-use crate::observability::{ProgramConfig, RuntimeEvent};
+use crate::{
+    Error, Result,
+    observability::{ProgramConfig, RuntimeEvent},
+};
 use futures::channel::mpsc::UnboundedSender;
-use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-/// Report that a message could not be enqueued because the program is no longer
-/// alive.
-///
-/// This is returned only when every receiver for the program's internal queue
-/// has been dropped, which happens after the mounted [`crate::Program`] has
-/// been released.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DispatchError(());
-
-impl DispatchError {
-    pub(crate) fn unavailable() -> Self {
-        Self(())
-    }
-}
-
-impl fmt::Display for DispatchError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("program is no longer available")
-    }
-}
-
-impl Error for DispatchError {}
-
-type DispatchFn<Msg> = Arc<dyn Fn(Msg) -> Result<(), DispatchError> + Send + Sync>;
+type DispatchFn<Msg> = Arc<dyn Fn(Msg) -> Result<()> + Send + Sync>;
 
 /// Send messages back into a mounted [`crate::Program`].
 ///
@@ -47,7 +26,7 @@ impl<Msg: Send + 'static> Dispatcher<Msg> {
                 let message_description = config.describe_message_value(&msg);
                 let result = sender
                     .unbounded_send(msg)
-                    .map_err(|_| DispatchError::unavailable());
+                    .map_err(|_| Error::ProgramUnavailable);
 
                 match &result {
                     Ok(()) => config.observe(RuntimeEvent::DispatchAccepted {
@@ -71,9 +50,9 @@ impl<Msg: Send + 'static> Dispatcher<Msg> {
     ///
     /// # Errors
     ///
-    /// Returns [`DispatchError`] when the target program has already been
-    /// released and can no longer accept messages.
-    pub fn dispatch(&self, msg: Msg) -> Result<(), DispatchError> {
+    /// Returns [`Error::ProgramUnavailable`] when the target program has
+    /// already been released and can no longer accept messages.
+    pub fn dispatch(&self, msg: Msg) -> Result<()> {
         (self.dispatch)(msg)
     }
 
@@ -121,6 +100,12 @@ impl<Msg> Clone for Dispatcher<Msg> {
         Self {
             dispatch: self.dispatch.clone(),
         }
+    }
+}
+
+impl<Msg> fmt::Debug for Dispatcher<Msg> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("Dispatcher").field(&"..").finish()
     }
 }
 
@@ -180,6 +165,7 @@ mod tests {
         drop(receiver);
 
         let error = dispatcher.dispatch(Msg::Set(2)).unwrap_err();
+        assert_eq!(error, Error::ProgramUnavailable);
         assert_eq!(error.to_string(), "program is no longer available");
         assert_eq!(
             dispatch_events.lock().unwrap().as_slice(),

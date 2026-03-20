@@ -1,12 +1,7 @@
 use crate::{CommandKind, Key};
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
-/// Observe [`RuntimeEvent`] values emitted by a mounted [`crate::Program`].
-///
-/// The runtime invokes observers synchronously at the event site. Keep the
-/// callback lightweight and non-blocking so dispatch, queue draining, and
-/// effect completion stay responsive.
-pub type RuntimeObserver<Msg> = Arc<dyn for<'a> Fn(RuntimeEvent<'a, Msg>) + Send + Sync>;
+type RuntimeObserverFn<Msg> = Arc<dyn for<'a> Fn(RuntimeEvent<'a, Msg>) + Send + Sync>;
 type DescribeMessageFn<Msg> = Arc<dyn Fn(&Msg) -> Arc<str> + Send + Sync>;
 type DescribeKeyFn = Arc<dyn Fn(&Key) -> Arc<str> + Send + Sync>;
 
@@ -15,7 +10,8 @@ type DescribeKeyFn = Arc<dyn Fn(&Key) -> Arc<str> + Send + Sync>;
 /// These events describe enqueue attempts, queue draining, command scheduling,
 /// keyed task replacement, effect completion, and subscription lifecycle
 /// reconciliation. They are emitted only when a [`ProgramConfig`] installs an
-/// [`RuntimeObserver`].
+/// observer callback.
+#[derive(Debug)]
 pub enum RuntimeEvent<'a, Msg> {
     /// Record that [`crate::Dispatcher::dispatch`] accepted a message.
     DispatchAccepted {
@@ -180,9 +176,10 @@ pub enum RuntimeEvent<'a, Msg> {
 /// Use this builder to attach observability hooks or queue-warning thresholds
 /// before calling [`crate::Program::mount_with`] or
 /// [`crate::ModelExt::into_program_with`].
+#[must_use]
 pub struct ProgramConfig<Msg> {
     pub(crate) queue_warning_threshold: Option<usize>,
-    pub(crate) observer: Option<RuntimeObserver<Msg>>,
+    pub(crate) observer: Option<RuntimeObserverFn<Msg>>,
     pub(crate) describe_message: Option<DescribeMessageFn<Msg>>,
     pub(crate) describe_key: Option<DescribeKeyFn>,
 }
@@ -209,9 +206,20 @@ impl<Msg> Default for ProgramConfig<Msg> {
     }
 }
 
+impl<Msg> fmt::Debug for ProgramConfig<Msg> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProgramConfig")
+            .field("queue_warning_threshold", &self.queue_warning_threshold)
+            .field("has_observer", &self.observer.is_some())
+            .field("has_message_describer", &self.describe_message.is_some())
+            .field("has_key_describer", &self.describe_key.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<Msg> ProgramConfig<Msg> {
     /// Create a default runtime configuration.
-    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -221,14 +229,12 @@ impl<Msg> ProgramConfig<Msg> {
     ///
     /// The runtime compares the queue length after enqueueing a message and
     /// before draining resumes.
-    #[must_use]
     pub fn queue_warning_threshold(mut self, threshold: usize) -> Self {
         self.queue_warning_threshold = Some(threshold);
         self
     }
 
     /// Attach a runtime observer.
-    #[must_use]
     pub fn observer<F>(mut self, observer: F) -> Self
     where
         F: for<'a> Fn(RuntimeEvent<'a, Msg>) + Send + Sync + 'static,
@@ -238,7 +244,6 @@ impl<Msg> ProgramConfig<Msg> {
     }
 
     /// Provide a message formatter for observability hooks.
-    #[must_use]
     pub fn describe_message<F, S>(mut self, describe_message: F) -> Self
     where
         F: Fn(&Msg) -> S + Send + Sync + 'static,
@@ -249,7 +254,6 @@ impl<Msg> ProgramConfig<Msg> {
     }
 
     /// Provide a key formatter for observability hooks.
-    #[must_use]
     pub fn describe_key<F, S>(mut self, describe_key: F) -> Self
     where
         F: Fn(&Key) -> S + Send + Sync + 'static,
