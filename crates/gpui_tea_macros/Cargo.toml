@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme.workspace = true
 publish = ["crates-io"]
 categories.workspace = true
 description = "Procedural macros for gpui_tea."
