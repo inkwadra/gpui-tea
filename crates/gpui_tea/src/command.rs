@@ -300,8 +300,8 @@ impl<Msg: Send + 'static> Command<Msg> {
 
     /// Return a command that cancels the keyed effect associated with `key`.
     ///
-    /// Canceling a key detaches the running task from runtime bookkeeping. If that task later
-    /// completes, its result is ignored.
+    /// Canceling a key requests cancellation of the tracked keyed task. If that task manages to
+    /// complete in a race, its later completion is ignored.
     ///
     /// # Arguments
     ///
@@ -402,11 +402,23 @@ impl<Msg: Send + 'static> Command<Msg> {
         let label = self.label;
 
         match self.inner {
-            CommandInner::None => Command::none(),
-            CommandInner::Emit(message) => Command::emit(f(message)),
-            CommandInner::Batch(commands) => {
-                Command::batch(commands.into_iter().map(|command| command.map(f.clone())))
-            }
+            CommandInner::None => Command {
+                inner: CommandInner::None,
+                label,
+            },
+            CommandInner::Emit(message) => Command {
+                inner: CommandInner::Emit(f(message)),
+                label,
+            },
+            CommandInner::Batch(commands) => Command {
+                inner: CommandInner::Batch(
+                    commands
+                        .into_iter()
+                        .map(|command| command.map(f.clone()))
+                        .collect(),
+                ),
+                label,
+            },
             CommandInner::Effect(effect) => Command {
                 inner: CommandInner::Effect(map_effect(effect, f)),
                 label,
