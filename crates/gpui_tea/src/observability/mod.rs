@@ -20,12 +20,12 @@ pub use events::{RuntimeEvent, TelemetryEnvelope, TelemetryEvent, TelemetryMetad
 pub use policy::{QueueOverflowAction, QueuePolicy};
 
 type QueueDepthFn = Arc<dyn Fn() -> usize + Send + Sync>;
+static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct Observability<Msg> {
     config: ProgramConfig<Msg>,
     program_id: ProgramId,
     program_description: Option<Arc<str>>,
-    next_event_id: Arc<AtomicU64>,
     queue_depth: QueueDepthFn,
 }
 
@@ -35,7 +35,6 @@ impl<Msg> Clone for Observability<Msg> {
             config: self.config.clone(),
             program_id: self.program_id,
             program_description: self.program_description.clone(),
-            next_event_id: self.next_event_id.clone(),
             queue_depth: self.queue_depth.clone(),
         }
     }
@@ -50,7 +49,6 @@ impl<Msg> Observability<Msg> {
             config,
             program_id,
             program_description,
-            next_event_id: Arc::new(AtomicU64::new(1)),
             queue_depth,
         }
     }
@@ -87,7 +85,7 @@ impl<Msg> Observability<Msg> {
                 metadata: TelemetryMetadata {
                     program_id: self.program_id,
                     program_description: self.program_description.clone(),
-                    event_id: self.next_event_id.fetch_add(1, Ordering::Relaxed),
+                    event_id: NEXT_EVENT_ID.fetch_add(1, Ordering::Relaxed),
                     emitted_at: SystemTime::now(),
                     queue_depth: self.queue_depth(),
                 },
