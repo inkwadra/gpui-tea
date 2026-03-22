@@ -192,13 +192,17 @@ fn main() {
 ### Common Patterns
 
 - Bootstrap state with `Model::init()` and return `Command::emit(...)` or an async command.
+  `init()` commands use the same queue-drain semantics as commands returned from `update()`.
 - Schedule asynchronous work with `Command::foreground(...)` or `Command::background(...)`.
 - Replace in-flight work by key with `Command::foreground_keyed(...)` or
-  `Command::background_keyed(...)`. Older tasks may still finish, but the runtime ignores stale
-  completions.
-- Cancel tracked keyed work with `Command::cancel_key(...)`.
+  `Command::background_keyed(...)`. Replacing a keyed task requests cancellation of the older task,
+  and any completion that still races in after replacement is ignored as stale.
+- Cancel tracked keyed work with `Command::cancel_key(...)`, which requests cancellation for the
+  current task on that key.
+- Dropping a mounted `Program` cancels outstanding async effects that have not completed yet.
 - Declare long-lived external event sources in `subscriptions()` with `Subscription::new(...)`.
-- Compose child models with `ModelContext::scope(...)` or `#[derive(Composite)]`.
+- Compose child models with `ModelContext::scope(...)` or `#[derive(Composite)]`. Child paths are
+  part of runtime identity, so they must stay stable and unique among siblings.
 
 ## API Reference
 
@@ -259,8 +263,9 @@ pub fn mount_with(model: M, config: ProgramConfig<M::Msg>, cx: &mut App) -> Enti
 
 - Parameters: `model` is the initial state, `config` customizes queue and observability behavior,
   and `cx` is the GPUI application context.
-- Behavior: mounting immediately calls `Model::init()`, executes its returned command, and performs
-  the initial subscription reconciliation before returning.
+- Behavior: mounting immediately calls `Model::init()`, executes its returned command through the
+  normal queue-drain model, drains all causally enqueued synchronous init messages, and then
+  performs the initial subscription reconciliation before returning.
 - Return type: `Entity<Program<M>>`.
 
 Example:
@@ -289,7 +294,10 @@ pub fn map<F, NewMsg>(self, f: F) -> Command<NewMsg>;
 - Parameters: commands take either a concrete message, an async effect closure, or a stable `Key`
   used for deduplication and cancellation.
 - Keyed commands are latest-wins: scheduling a newer keyed command replaces the tracked task for
-  that key, and any later completion from the older task is ignored rather than aborted.
+  that key and requests cancellation of the older task. If the older task still completes in a
+  race, the runtime ignores that stale completion.
+- Non-keyed async commands remain owned by the mounted `Program` until they complete or the
+  program is dropped.
 - Return type: `Command<Msg>` or `Command<NewMsg>` for `map`.
 
 Example:
@@ -344,13 +352,14 @@ struct Parent {
 }
 ```
 
-- Parameters: `message` declares the parent message type; each `child` attribute defines the child
-  path, the lift function, and the extractor used to route parent messages back to the child.
+- Parameters: `message` declares the parent message type; each `child` attribute defines a stable
+  string-literal path segment, the lift function, and the extractor used to route parent messages
+  back to the child. Sibling child paths must be unique within the derive target.
 - Generated helpers: the macro adds hidden aggregate methods `__composite_init`,
   `__composite_update`, and `__composite_subscriptions`, plus one hidden `<field>_view` helper per
   child field.
-- Caveat: child subscriptions must still resolve to unique scoped keys. The generated composite
-  subscription helper panics if two child subscriptions collide after scoping.
+- Manual `ModelContext::scope(...)` remains more flexible, but the caller is responsible for
+  choosing path segments that remain stable and unique for the child lifecycle.
 
 Example:
 
@@ -379,10 +388,11 @@ Each example focuses on one runtime behavior:
 - `counter`: minimal mounted program and message dispatch from the view.
 - `init_command`: bootstrap work triggered by `Model::init()`.
 - `keyed_effect`: latest-wins async work on a stable key.
-- `nested_models`: `Composite` composition and child path scoping.
+- `nested_models`: `Composite` composition with stable child path segments.
 - `subscriptions`: declarative subscription reconciliation by key.
 - `observability`: `RuntimeEvent` hooks with readable labels.
-- `telemetry`: structured tracing output for queue activity, keyed replacement, and cancellation.
+- `telemetry`: structured tracing output for queue activity, keyed replacement, cancellation, and
+  stale-completion races.
 
 For repository development, the `Justfile` mirrors CI:
 

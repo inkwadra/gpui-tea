@@ -82,7 +82,7 @@ impl Model for KeyedEffectDemo {
                 ))
                 .child(ui::Text::new(
                     ui::TextRole::Body,
-                    "Both commands share one key. The latest completion remains authoritative and stale work is ignored.",
+                    "Both commands share one key. The second run replaces the first, requests cancellation, and only a raced stale completion could still be ignored later.",
                 ))
                 .child(ui::DetailRow::new("Current status", self.status))
                 .child(ui::DetailRow::new("Applied messages", applied))

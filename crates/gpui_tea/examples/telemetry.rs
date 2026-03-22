@@ -58,7 +58,7 @@ mod enabled {
             if self.runs == 0 {
                 "Start any sequence to generate tracing events."
             } else {
-                "Use cancel actions to inspect keyed cancellation and stale completion handling."
+                "Use cancel actions to inspect keyed cancellation; stale completion appears only if completion races with replacement or cancel."
             }
         }
     }
@@ -163,7 +163,7 @@ mod enabled {
                     .child(ui::Text::new(ui::TextRole::Title, "Telemetry + tracing"))
                     .child(ui::Text::new(
                         ui::TextRole::Body,
-                        "A compact GPUI demo for queue activity, keyed replacement, cancellation, and structured tracing output.",
+                        "A compact GPUI demo for queue activity, keyed replacement, cancellation requests, and structured tracing output.",
                     )),
             )
             .child(ui::Badge::new("Tracing enabled").tone(ui::BannerTone::Info))
@@ -194,7 +194,7 @@ mod enabled {
         section("Interactive scenarios")
             .child(ui::Text::new(
                 ui::TextRole::Caption,
-                "Use the first row to generate replacement and stale-completion events. Use the second row to explicitly cancel keyed work or reset the demo state.",
+                "Use the first row to generate replacement and, if timings race, stale-completion events. Use the second row to explicitly cancel keyed work or reset the demo state.",
             ))
             .child(
                 ui::action_row()
@@ -285,7 +285,7 @@ mod enabled {
             )
             .child(
                 ui::Banner::new(
-                    "Cancel demo: produces keyed.canceled first, then a later stale_ignored completion.",
+                    "Cancel demo: produces keyed.canceled immediately; a later stale_ignored completion appears only if the old task wins a race before cancellation takes effect.",
                 )
                 .tone(ui::BannerTone::Warning),
             )

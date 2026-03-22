@@ -131,7 +131,7 @@ impl Model for NestedDemo {
                 .child(ui::Text::new(ui::TextRole::Title, "Composite models"))
                 .child(ui::Text::new(
                     ui::TextRole::Body,
-                    "Both child counters reuse the same local messages while keyed work and subscriptions stay isolated by explicit paths.",
+                    "Both child counters reuse the same local messages while keyed work and subscriptions stay isolated by stable explicit path segments.",
                 ))
                 .child(
                     ui::action_row()

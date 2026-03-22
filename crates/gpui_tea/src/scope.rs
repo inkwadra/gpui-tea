@@ -157,6 +157,10 @@ impl<Msg> ModelContext<Msg> {
     }
 
     /// Create a scope for a child model under `path`.
+    ///
+    /// The caller is responsible for choosing a path segment that stays stable for the lifetime of
+    /// the child model and remains unique among siblings. Scoped keyed commands and subscriptions
+    /// derive their identity from this path.
     #[must_use]
     pub fn scope<ChildMsg, F>(
         &self,

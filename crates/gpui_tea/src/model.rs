@@ -7,6 +7,9 @@ pub trait Model: Sized + 'static {
     type Msg: Send + 'static;
 
     /// Initialize the model after it is mounted.
+    ///
+    /// Commands returned from `init()` obey the same queue-drain semantics as commands returned
+    /// from [`Model::update()`].
     fn init(&mut self, _cx: &mut App, _scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
         Command::none()
     }
