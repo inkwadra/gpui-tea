@@ -1,5 +1,5 @@
 use quote::format_ident;
-use syn::{Expr, Generics, Ident, Type};
+use syn::{Expr, Generics, Ident, LitStr, Type};
 
 pub(crate) struct CompositeSpec {
     pub(crate) struct_ident: Ident,
@@ -11,7 +11,7 @@ pub(crate) struct CompositeSpec {
 pub(crate) struct ChildSpec {
     pub(crate) field_ident: Ident,
     pub(crate) field_ty: Type,
-    pub(crate) path: Expr,
+    pub(crate) path: LitStr,
     pub(crate) lift: Expr,
     pub(crate) extract: Expr,
 }
@@ -43,7 +43,7 @@ mod tests {
     use super::ChildSpec;
     use proc_macro2::Span;
     use quote::ToTokens;
-    use syn::{Expr, Ident, Type, parse_quote};
+    use syn::{Expr, Ident, LitStr, Type, parse_quote};
 
     fn child(field_ident: Ident) -> ChildSpec {
         ChildSpec {
@@ -74,7 +74,7 @@ mod tests {
     fn child_spec_keeps_original_field_components() {
         let child = child(Ident::new("sidebar", Span::call_site()));
         let field_ty: Type = parse_quote!(ChildModel);
-        let path: Expr = parse_quote!("child");
+        let path = LitStr::new("child", Span::call_site());
         let lift: Expr = parse_quote!(ParentMsg::Child);
         let extract: Expr = parse_quote!(ParentMsg::into_child);
 

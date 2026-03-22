@@ -1,0 +1,5 @@
+error: duplicate child path `shared` for fields `first` and `second`
+  --> tests/ui/duplicate_sibling_child_path.rs:32:20
+   |
+32 |     #[child(path = "shared", lift = Msg::Second, extract = Msg::into_second)]
+   |                    ^^^^^^^^

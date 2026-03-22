@@ -1,0 +1,8 @@
+error[E0308]: mismatched types
+  --> tests/ui/invalid_lift.rs:52:36
+   |
+52 |     #[child(path = "child", lift = lift_child, extract = Msg::into_child)]
+   |                                    ^^^^^^^^^^ expected fn pointer, found fn item
+   |
+   = note: expected fn pointer `fn(ChildMsg) -> Msg`
+                 found fn item `fn(usize) -> Msg {lift_child}`

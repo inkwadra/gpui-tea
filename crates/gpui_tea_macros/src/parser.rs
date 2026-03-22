@@ -1,10 +1,10 @@
 use crate::spec::{ChildSpec, CompositeSpec};
 use proc_macro2::Span;
 use quote::ToTokens;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use syn::{
-    Attribute, Data, DeriveInput, Error, Expr, Field, Fields, FieldsNamed, Ident, Meta, Result,
-    Token, Type, punctuated::Punctuated, spanned::Spanned,
+    Attribute, Data, DeriveInput, Error, Expr, Field, Fields, FieldsNamed, Ident, Lit, LitStr,
+    Meta, Result, Token, Type, punctuated::Punctuated, spanned::Spanned,
 };
 
 /// # Errors
@@ -123,6 +123,9 @@ fn parse_children(fields: FieldsNamed) -> Result<Vec<ChildSpec>> {
     if let Err(error) = ensure_unique_view_method_names(&children) {
         combine_error(&mut errors, error);
     }
+    if let Err(error) = ensure_unique_child_paths(&children) {
+        combine_error(&mut errors, error);
+    }
 
     match errors {
         Some(error) => Err(error),
@@ -153,6 +156,33 @@ fn ensure_unique_view_method_names(children: &[ChildSpec]) -> Result<()> {
     }
 }
 
+fn ensure_unique_child_paths(children: &[ChildSpec]) -> Result<()> {
+    let mut seen_paths = HashMap::new();
+    let mut errors = None;
+
+    for child in children {
+        let path_value = child.path.value();
+        if let Some(first_field) = seen_paths.insert(path_value.clone(), child.field_ident.clone())
+        {
+            combine_error(
+                &mut errors,
+                Error::new(
+                    child.path.span(),
+                    format!(
+                        "duplicate child path `{path_value}` for fields `{first_field}` and `{}`",
+                        child.field_ident
+                    ),
+                ),
+            );
+        }
+    }
+
+    match errors {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 /// # Errors
 ///
 /// Returns an error if the field is unnamed or if `#[child(...)]` attributes are missing
@@ -167,6 +197,7 @@ fn parse_child(field: Field) -> Result<Option<ChildSpec>> {
     };
 
     let mut saw_child = false;
+    let mut saw_path = false;
     let mut path = None;
     let mut lift = None;
     let mut extract = None;
@@ -180,7 +211,14 @@ fn parse_child(field: Field) -> Result<Option<ChildSpec>> {
         saw_child = true;
         let metas = attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
         for meta in metas {
-            parse_child_meta(meta, &mut path, &mut lift, &mut extract, &mut errors);
+            parse_child_meta(
+                meta,
+                &mut saw_path,
+                &mut path,
+                &mut lift,
+                &mut extract,
+                &mut errors,
+            );
         }
     }
 
@@ -188,7 +226,7 @@ fn parse_child(field: Field) -> Result<Option<ChildSpec>> {
         return Ok(None);
     }
 
-    if path.is_none() {
+    if !saw_path {
         combine_error(&mut errors, Error::new(field_span, "missing `path`"));
     }
     if lift.is_none() {
@@ -244,20 +282,16 @@ fn parse_composite_meta(meta: Meta, message_ty: &mut Option<Type>, errors: &mut 
 
 fn parse_child_meta(
     meta: Meta,
-    path: &mut Option<Expr>,
+    saw_path: &mut bool,
+    path: &mut Option<LitStr>,
     lift: &mut Option<Expr>,
     extract: &mut Option<Expr>,
     errors: &mut Option<Error>,
 ) {
     match meta {
         Meta::NameValue(name_value) if name_value.path.is_ident("path") => {
-            set_child_expr(
-                path,
-                name_value.path.span(),
-                "path",
-                name_value.value,
-                errors,
-            );
+            *saw_path = true;
+            set_child_path(path, name_value.path.span(), name_value.value, errors);
         }
         Meta::NameValue(name_value) if name_value.path.is_ident("lift") => {
             set_child_expr(
@@ -288,6 +322,27 @@ fn parse_child_meta(
         Meta::List(meta_list) => combine_error(
             errors,
             Error::new(meta_list.path.span(), "unsupported `child` attribute"),
+        ),
+    }
+}
+
+fn set_child_path(slot: &mut Option<LitStr>, span: Span, value: Expr, errors: &mut Option<Error>) {
+    if slot.is_some() {
+        combine_error(errors, Error::new(span, "duplicate `path` attribute"));
+        return;
+    }
+
+    match value {
+        Expr::Lit(expr_lit) => match expr_lit.lit {
+            Lit::Str(path) => *slot = Some(path),
+            _ => combine_error(
+                errors,
+                Error::new(expr_lit.span(), "`path` must be a string literal"),
+            ),
+        },
+        other => combine_error(
+            errors,
+            Error::new(other.span(), "`path` must be a string literal"),
         ),
     }
 }
@@ -419,6 +474,42 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "duplicate generated helper name `child_view`"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_sibling_child_paths() {
+        let input: DeriveInput = parse_quote! {
+            #[derive(Composite)]
+            #[composite(message = ParentMsg)]
+            struct Parent {
+                #[child(path = "shared", lift = ParentMsg::First, extract = ParentMsg::into_first)]
+                first: FirstChild,
+                #[child(path = "shared", lift = ParentMsg::Second, extract = ParentMsg::into_second)]
+                second: SecondChild,
+            }
+        };
+
+        assert_eq!(
+            parse_error(input).to_string(),
+            "duplicate child path `shared` for fields `first` and `second`"
+        );
+    }
+
+    #[test]
+    fn rejects_non_literal_child_path() {
+        let input: DeriveInput = parse_quote! {
+            #[derive(Composite)]
+            #[composite(message = ParentMsg)]
+            struct Parent {
+                #[child(path = make_path(), lift = ParentMsg::Child, extract = ParentMsg::into_child)]
+                child: ChildModel,
+            }
+        };
+
+        assert_eq!(
+            parse_error(input).to_string(),
+            "`path` must be a string literal"
         );
     }
 
