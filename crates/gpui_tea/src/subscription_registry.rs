@@ -31,7 +31,9 @@ impl SubscriptionRegistry {
         observability: &Observability<Msg>,
         cx: &mut Context<'_, T>,
     ) -> SubscriptionReconcileStats {
+        let mut current_active = std::mem::take(&mut self.active);
         let mut next_active = HashMap::with_capacity(subscriptions.len());
+        let mut pending_builds = Vec::new();
         let mut added = 0;
         let mut retained = 0;
 
@@ -39,7 +41,7 @@ impl SubscriptionRegistry {
             let key = subscription.key;
             let label = subscription.label;
 
-            if let Some(active) = self.active.remove(&key) {
+            if let Some(active) = current_active.remove(&key) {
                 retained += 1;
                 observability.observe_runtime(RuntimeEvent::SubscriptionRetained {
                     key: &key,
@@ -60,24 +62,12 @@ impl SubscriptionRegistry {
                 );
             } else {
                 added += 1;
-                let mut subscription_context = SubscriptionContext::new(cx, dispatcher.clone());
-                let handle = (subscription.builder)(&mut subscription_context);
-                observability.observe_runtime(RuntimeEvent::SubscriptionBuilt {
-                    key: &key,
-                    key_description: observability.describe_key_value(&key),
-                    label: label.as_deref(),
-                });
-                observability.observe_telemetry(TelemetryEvent::SubscriptionBuilt {
-                    key: &key,
-                    key_description: observability.describe_key_value(&key),
-                    label: label.as_deref(),
-                });
-                next_active.insert(key, ActiveSubscription { handle, label });
+                pending_builds.push((key, label, subscription.builder));
             }
         }
 
-        let removed = self.active.len();
-        for (key, active) in self.active.drain() {
+        let removed = current_active.len();
+        for (key, active) in current_active {
             observability.observe_runtime(RuntimeEvent::SubscriptionRemoved {
                 key: &key,
                 key_description: observability.describe_key_value(&key),
@@ -89,6 +79,23 @@ impl SubscriptionRegistry {
                 label: active.label.as_deref(),
             });
         }
+
+        for (key, label, builder) in pending_builds {
+            let mut subscription_context = SubscriptionContext::new(cx, dispatcher.clone());
+            let handle = builder(&mut subscription_context);
+            observability.observe_runtime(RuntimeEvent::SubscriptionBuilt {
+                key: &key,
+                key_description: observability.describe_key_value(&key),
+                label: label.as_deref(),
+            });
+            observability.observe_telemetry(TelemetryEvent::SubscriptionBuilt {
+                key: &key,
+                key_description: observability.describe_key_value(&key),
+                label: label.as_deref(),
+            });
+            next_active.insert(key, ActiveSubscription { handle, label });
+        }
+
         self.active = next_active;
 
         SubscriptionReconcileStats {
