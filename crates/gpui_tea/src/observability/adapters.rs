@@ -306,44 +306,70 @@ pub fn observe_metrics_telemetry<Msg>(envelope: TelemetryEnvelope<'_, Msg>) {
     use metrics::{counter, gauge};
 
     let TelemetryEnvelope { metadata, event } = envelope;
-    gauge!("gpui_tea.queue.depth").set(metadata.queue_depth as f64);
+    let program_id = metadata.program_id.get().to_string();
+    gauge!("gpui_tea.queue.depth", "program_id" => program_id.clone())
+        .set(metadata.queue_depth as f64);
 
     match event {
         TelemetryEvent::DispatchAccepted { .. } => {
-            counter!("gpui_tea.dispatch.accepted").increment(1);
+            counter!("gpui_tea.dispatch.accepted", "program_id" => program_id.clone()).increment(1);
         }
         TelemetryEvent::DispatchRejected { .. } => {
-            counter!("gpui_tea.dispatch.rejected").increment(1);
+            counter!("gpui_tea.dispatch.rejected", "program_id" => program_id.clone()).increment(1);
         }
         TelemetryEvent::QueueOverflow { action, .. } => {
-            counter!("gpui_tea.queue.overflow", "action" => format!("{action:?}")).increment(1);
+            counter!(
+                "gpui_tea.queue.overflow",
+                "program_id" => program_id.clone(),
+                "action" => format!("{action:?}")
+            )
+            .increment(1);
         }
         TelemetryEvent::CommandScheduled { kind, .. } => {
-            counter!("gpui_tea.command.scheduled", "kind" => format!("{kind:?}")).increment(1);
+            counter!(
+                "gpui_tea.command.scheduled",
+                "program_id" => program_id.clone(),
+                "kind" => format!("{kind:?}")
+            )
+            .increment(1);
         }
         TelemetryEvent::EffectStarted { kind, .. } => {
-            counter!("gpui_tea.effect.started", "kind" => format!("{kind:?}")).increment(1);
+            counter!(
+                "gpui_tea.effect.started",
+                "program_id" => program_id.clone(),
+                "kind" => format!("{kind:?}")
+            )
+            .increment(1);
         }
         TelemetryEvent::EffectCompleted { kind, .. } => {
-            counter!("gpui_tea.effect.completed", "kind" => format!("{kind:?}")).increment(1);
+            counter!(
+                "gpui_tea.effect.completed",
+                "program_id" => program_id.clone(),
+                "kind" => format!("{kind:?}")
+            )
+            .increment(1);
         }
         TelemetryEvent::KeyedCommandReplaced { .. } => {
-            counter!("gpui_tea.keyed.replaced").increment(1);
+            counter!("gpui_tea.keyed.replaced", "program_id" => program_id.clone()).increment(1);
         }
         TelemetryEvent::KeyedCommandCanceled { .. } => {
-            counter!("gpui_tea.keyed.canceled").increment(1);
+            counter!("gpui_tea.keyed.canceled", "program_id" => program_id.clone()).increment(1);
         }
         TelemetryEvent::StaleKeyedCompletionIgnored { .. } => {
-            counter!("gpui_tea.keyed.stale_ignored").increment(1);
+            counter!("gpui_tea.keyed.stale_ignored", "program_id" => program_id.clone())
+                .increment(1);
         }
         TelemetryEvent::SubscriptionBuilt { .. } => {
-            counter!("gpui_tea.subscription.built").increment(1);
+            counter!("gpui_tea.subscription.built", "program_id" => program_id.clone())
+                .increment(1);
         }
         TelemetryEvent::SubscriptionRemoved { .. } => {
-            counter!("gpui_tea.subscription.removed").increment(1);
+            counter!("gpui_tea.subscription.removed", "program_id" => program_id.clone())
+                .increment(1);
         }
         TelemetryEvent::SubscriptionsReconciled { active, .. } => {
-            gauge!("gpui_tea.subscription.active").set(active as f64);
+            gauge!("gpui_tea.subscription.active", "program_id" => program_id.clone())
+                .set(active as f64);
         }
         TelemetryEvent::QueueDrainStarted { .. }
         | TelemetryEvent::QueueWarning { .. }
@@ -426,7 +452,114 @@ mod metrics_tests {
         CommandKind,
         observability::{ProgramId, TelemetryEnvelope, TelemetryEvent, TelemetryMetadata},
     };
-    use std::sync::Arc;
+    use metrics::{
+        Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata,
+        Recorder, SharedString, Unit,
+    };
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug)]
+    struct RecordingHandle {
+        key: Key,
+        seen: Arc<Mutex<Vec<Key>>>,
+    }
+
+    impl RecordingHandle {
+        fn record(&self) {
+            self.seen.lock().unwrap().push(self.key.clone());
+        }
+    }
+
+    impl CounterFn for RecordingHandle {
+        fn increment(&self, _value: u64) {
+            self.record();
+        }
+
+        fn absolute(&self, _value: u64) {
+            self.record();
+        }
+    }
+
+    impl GaugeFn for RecordingHandle {
+        fn increment(&self, _value: f64) {
+            self.record();
+        }
+
+        fn decrement(&self, _value: f64) {
+            self.record();
+        }
+
+        fn set(&self, _value: f64) {
+            self.record();
+        }
+    }
+
+    impl HistogramFn for RecordingHandle {
+        fn record(&self, _value: f64) {
+            self.record();
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingRecorder {
+        seen: Arc<Mutex<Vec<Key>>>,
+    }
+
+    impl Recorder for RecordingRecorder {
+        fn describe_counter(
+            &self,
+            _key_name: KeyName,
+            _unit: Option<Unit>,
+            _description: SharedString,
+        ) {
+        }
+
+        fn describe_gauge(
+            &self,
+            _key_name: KeyName,
+            _unit: Option<Unit>,
+            _description: SharedString,
+        ) {
+        }
+
+        fn describe_histogram(
+            &self,
+            _key_name: KeyName,
+            _unit: Option<Unit>,
+            _description: SharedString,
+        ) {
+        }
+
+        fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            Counter::from_arc(Arc::new(RecordingHandle {
+                key: key.clone(),
+                seen: self.seen.clone(),
+            }))
+        }
+
+        fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            Gauge::from_arc(Arc::new(RecordingHandle {
+                key: key.clone(),
+                seen: self.seen.clone(),
+            }))
+        }
+
+        fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::from_arc(Arc::new(RecordingHandle {
+                key: key.clone(),
+                seen: self.seen.clone(),
+            }))
+        }
+    }
+
+    fn has_label(key: &Key, label_key: &str, label_value: &str) -> bool {
+        key.labels()
+            .any(|label| label.key() == label_key && label.value() == label_value)
+    }
+
+    fn has_any_label(key: &Key, label_key: &str) -> bool {
+        key.labels().any(|label| label.key() == label_key)
+    }
 
     #[test]
     fn metrics_adapter_accepts_envelope() {
@@ -448,5 +581,63 @@ mod metrics_tests {
                 message_description: Some(Arc::from("loaded")),
             },
         });
+    }
+
+    #[test]
+    fn metrics_adapter_labels_metrics_with_program_id_only() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = RecordingRecorder { seen: seen.clone() };
+
+        metrics::with_local_recorder(&recorder, || {
+            observe_metrics_telemetry::<()>(TelemetryEnvelope {
+                metadata: TelemetryMetadata {
+                    program_id: ProgramId::from_raw(7),
+                    program_description: Some(Arc::from("program:7")),
+                    event_id: 1,
+                    emitted_at: std::time::SystemTime::now(),
+                    queue_depth: 3,
+                },
+                event: TelemetryEvent::SubscriptionsReconciled {
+                    active: 2,
+                    added: 1,
+                    removed: 0,
+                    retained: 1,
+                },
+            });
+
+            observe_metrics_telemetry::<()>(TelemetryEnvelope {
+                metadata: TelemetryMetadata {
+                    program_id: ProgramId::from_raw(7),
+                    program_description: Some(Arc::from("program:7")),
+                    event_id: 2,
+                    emitted_at: std::time::SystemTime::now(),
+                    queue_depth: 1,
+                },
+                event: TelemetryEvent::EffectCompleted {
+                    kind: CommandKind::Background,
+                    label: Some("load"),
+                    key: None,
+                    key_description: None,
+                    emitted_message: true,
+                    message: None,
+                    message_description: Some(Arc::from("loaded")),
+                },
+            });
+        });
+
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|key| {
+            key.name() == "gpui_tea.queue.depth" && has_label(key, "program_id", "7")
+        }));
+        assert!(seen.iter().any(|key| {
+            key.name() == "gpui_tea.subscription.active" && has_label(key, "program_id", "7")
+        }));
+        assert!(seen.iter().any(|key| {
+            key.name() == "gpui_tea.effect.completed" && has_label(key, "program_id", "7")
+        }));
+        assert!(
+            seen.iter()
+                .all(|key| !has_any_label(key, "program_description"))
+        );
     }
 }
