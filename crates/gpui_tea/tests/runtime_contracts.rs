@@ -93,12 +93,154 @@ fn mount_runs_init_once_executes_initial_command_and_builds_initial_subscription
         .into_program(cx)
     });
 
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().init_calls, 1);
+        assert_eq!(program.model().state, 41);
+    });
+    assert_eq!(subscription_builds.load(Ordering::SeqCst), 1);
+
     cx.run_until_parked();
 
     program.read_with(cx, |program, _cx| {
         assert_eq!(program.model().init_calls, 1);
         assert_eq!(program.model().state, 41);
         assert_eq!(program.model().delivered, vec!["ready"]);
+    });
+    assert_eq!(subscription_builds.load(Ordering::SeqCst), 1);
+}
+
+#[gpui::test]
+fn mount_drains_batched_init_emits_with_update_equivalent_fifo_ordering(cx: &mut TestAppContext) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Msg {
+        A,
+        B,
+        C,
+    }
+
+    struct InitBatchModel {
+        trace: Vec<&'static str>,
+    }
+
+    impl Model for InitBatchModel {
+        type Msg = Msg;
+
+        fn init(&mut self, _cx: &mut App, _scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+            Command::batch([Command::emit(Msg::A), Command::emit(Msg::B)])
+        }
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::A => {
+                    self.trace.push("a");
+                    Command::emit(Msg::C)
+                }
+                Msg::B => {
+                    self.trace.push("b");
+                    Command::none()
+                }
+                Msg::C => {
+                    self.trace.push("c");
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let program: Entity<Program<InitBatchModel>> =
+        cx.update(|cx| InitBatchModel { trace: Vec::new() }.into_program(cx));
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().trace, vec!["a", "b", "c"]);
+    });
+}
+
+#[gpui::test]
+fn mount_reconciles_initial_subscriptions_after_init_without_enqueued_messages(
+    cx: &mut TestAppContext,
+) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Msg {}
+
+    struct InitSubscriptionModel {
+        initialized: bool,
+        init_calls: usize,
+        subscription_builds: Arc<AtomicUsize>,
+    }
+
+    impl Model for InitSubscriptionModel {
+        type Msg = Msg;
+
+        fn init(&mut self, _cx: &mut App, _scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+            self.initialized = true;
+            self.init_calls += 1;
+            Command::none()
+        }
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {}
+        }
+
+        fn subscriptions(
+            &self,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Subscriptions<Self::Msg> {
+            if !self.initialized {
+                return Subscriptions::none();
+            }
+
+            let subscription_builds = self.subscription_builds.clone();
+            Subscriptions::one(Subscription::new("init-only", move |_cx| {
+                subscription_builds.fetch_add(1, Ordering::SeqCst);
+                SubHandle::None
+            }))
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let subscription_builds = Arc::new(AtomicUsize::new(0));
+    let program: Entity<Program<InitSubscriptionModel>> = cx.update(|cx| {
+        InitSubscriptionModel {
+            initialized: false,
+            init_calls: 0,
+            subscription_builds: subscription_builds.clone(),
+        }
+        .into_program(cx)
+    });
+
+    program.read_with(cx, |program, _cx| {
+        assert!(program.model().initialized);
+        assert_eq!(program.model().init_calls, 1);
     });
     assert_eq!(subscription_builds.load(Ordering::SeqCst), 1);
 }
@@ -546,6 +688,95 @@ fn non_keyed_effects_and_optional_effects_complete_deterministically(cx: &mut Te
 }
 
 #[gpui::test]
+fn non_keyed_effects_are_canceled_when_program_is_dropped(cx: &mut TestAppContext) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Run,
+        Loaded(i32),
+    }
+
+    struct DropModel {
+        receiver: Option<oneshot::Receiver<i32>>,
+        loaded: Vec<i32>,
+    }
+
+    impl Model for DropModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Run => {
+                    let receiver = self
+                        .receiver
+                        .take()
+                        .expect("run should only be dispatched once in this test");
+                    Command::background(
+                        move |_| async move { receiver.await.ok().map(Msg::Loaded) },
+                    )
+                }
+                Msg::Loaded(value) => {
+                    self.loaded.push(value);
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let (sender, receiver) = oneshot::channel();
+    type DropProgram = Entity<Program<DropModel>>;
+
+    let program_slot: Arc<Mutex<Option<DropProgram>>> = Arc::new(Mutex::new(None));
+    let window = cx.update(|cx| {
+        let program_slot = program_slot.clone();
+        cx.open_window(gpui::WindowOptions::default(), move |_, cx| {
+            let program = Program::mount(
+                DropModel {
+                    receiver: Some(receiver),
+                    loaded: Vec::new(),
+                },
+                cx,
+            );
+            *program_slot.lock().unwrap() = Some(program.clone());
+            program
+        })
+        .unwrap()
+    });
+
+    let program = program_slot.lock().unwrap().take().unwrap();
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+    drop(program);
+
+    cx.executor().allow_parking();
+    dispatcher.dispatch(Msg::Run).unwrap();
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+    });
+    cx.run_until_parked();
+    cx.executor().forbid_parking();
+
+    assert_eq!(sender.send(7), Err(7));
+}
+
+#[gpui::test]
 fn mapped_command_transforms_messages_and_preserves_keyed_observability(cx: &mut TestAppContext) {
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Msg {
@@ -649,6 +880,126 @@ fn mapped_command_transforms_messages_and_preserves_keyed_observability(cx: &mut
 }
 
 #[gpui::test]
+fn child_scopes_preserve_emit_labels_when_lifting_messages(cx: &mut TestAppContext) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ChildMsg {
+        Run,
+        Loaded,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Msg {
+        Child(ChildMsg),
+    }
+
+    impl Msg {
+        fn into_child(self) -> Result<ChildMsg, Self> {
+            match self {
+                Self::Child(msg) => Ok(msg),
+            }
+        }
+    }
+
+    struct ChildModel;
+
+    impl Model for ChildModel {
+        type Msg = ChildMsg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                ChildMsg::Run => Command::emit(ChildMsg::Loaded).label("child-emit"),
+                ChildMsg::Loaded => Command::none(),
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    #[derive(Composite)]
+    #[composite(message = Msg)]
+    struct ParentModel {
+        #[child(path = "child", lift = Msg::Child, extract = Msg::into_child)]
+        child: ChildModel,
+        loaded: usize,
+    }
+
+    impl Model for ParentModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            cx: &mut App,
+            scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Child(ChildMsg::Loaded) => {
+                    self.loaded += 1;
+                    Command::none()
+                }
+                other => match self.__composite_update(other, cx, scope) {
+                    Ok(command) => command,
+                    Err(other) => panic!("unexpected unmatched message: {other:?}"),
+                },
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let labels = Arc::new(Mutex::new(Vec::new()));
+    let config = ProgramConfig::default().observer({
+        let labels = labels.clone();
+        move |event: RuntimeEvent<'_, Msg>| {
+            if let RuntimeEvent::CommandScheduled { label, .. } = event {
+                labels.lock().unwrap().push(label.map(ToOwned::to_owned));
+            }
+        }
+    });
+
+    let program: Entity<Program<ParentModel>> = cx.update(|cx| {
+        ParentModel {
+            child: ChildModel,
+            loaded: 0,
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    dispatcher.dispatch(Msg::Child(ChildMsg::Run)).unwrap();
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().loaded, 1);
+    });
+    assert_eq!(
+        labels.lock().unwrap().as_slice(),
+        &[Some(String::from("child-emit"))]
+    );
+}
+
+#[gpui::test]
 fn keyed_effects_are_latest_wins_and_cancel_replaced_tasks(cx: &mut TestAppContext) {
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Msg {
@@ -664,11 +1015,6 @@ fn keyed_effects_are_latest_wins_and_cancel_replaced_tasks(cx: &mut TestAppConte
             next_label: Option<String>,
         },
         Completed {
-            label: Option<String>,
-            emitted_message: bool,
-            message_description: Option<String>,
-        },
-        Stale {
             label: Option<String>,
             emitted_message: bool,
             message_description: Option<String>,
@@ -742,16 +1088,6 @@ fn keyed_effects_are_latest_wins_and_cancel_replaced_tasks(cx: &mut TestAppConte
                         emitted_message,
                         message_description: message_description.map(|value| value.to_string()),
                     }),
-                    RuntimeEvent::StaleKeyedCompletionIgnored {
-                        label,
-                        emitted_message,
-                        message_description,
-                        ..
-                    } => Some(KeyedEvent::Stale {
-                        label: label.map(ToOwned::to_owned),
-                        emitted_message,
-                        message_description: message_description.map(|value| value.to_string()),
-                    }),
                     _ => None,
                 };
 
@@ -792,7 +1128,7 @@ fn keyed_effects_are_latest_wins_and_cancel_replaced_tasks(cx: &mut TestAppConte
         assert_eq!(program.model().values, vec![2]);
     });
 
-    assert_eq!(first_tx.send(1), Ok(()));
+    assert_eq!(first_tx.send(1), Err(1));
     cx.run_until_parked();
     cx.executor().forbid_parking();
 
@@ -811,16 +1147,6 @@ fn keyed_effects_are_latest_wins_and_cancel_replaced_tasks(cx: &mut TestAppConte
                 label: Some(String::from("second")),
                 emitted_message: true,
                 message_description: Some(String::from("loaded:2")),
-            },
-            KeyedEvent::Completed {
-                label: Some(String::from("first")),
-                emitted_message: true,
-                message_description: Some(String::from("loaded:1")),
-            },
-            KeyedEvent::Stale {
-                label: Some(String::from("first")),
-                emitted_message: true,
-                message_description: Some(String::from("loaded:1")),
             },
         ]
     );
@@ -1021,13 +1347,13 @@ fn subscription_lifecycle_events_include_key_descriptions_and_labels_without_reb
     assert_eq!(
         events.lock().unwrap().as_slice(),
         &[
-            SubscriptionEvent::Built {
-                key_description: Some(String::from("Key(\"beta\")")),
-                label: Some(String::from("beta-v1")),
-            },
             SubscriptionEvent::Removed {
                 key_description: Some(String::from("Key(\"alpha\")")),
                 label: Some(String::from("alpha-v2")),
+            },
+            SubscriptionEvent::Built {
+                key_description: Some(String::from("Key(\"beta\")")),
+                label: Some(String::from("beta-v1")),
             },
             SubscriptionEvent::Summary {
                 active: 1,
@@ -1393,6 +1719,134 @@ fn composite_init_batches_child_lifecycle_and_parent_can_intercept_child_message
         assert_eq!(program.model().left.value, 1);
         assert_eq!(program.model().right.value, 1);
         assert_eq!(program.model().parent_only_hits, 1);
+    });
+}
+
+#[gpui::test]
+fn composite_init_preserves_sibling_ready_order_before_parent_follow_up(cx: &mut TestAppContext) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ChildMsg {
+        Ready,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Msg {
+        Left(ChildMsg),
+        Right(ChildMsg),
+        ParentFollowUp,
+    }
+
+    impl Msg {
+        fn into_left(self) -> Result<ChildMsg, Self> {
+            match self {
+                Self::Left(msg) => Ok(msg),
+                other => Err(other),
+            }
+        }
+
+        fn into_right(self) -> Result<ChildMsg, Self> {
+            match self {
+                Self::Right(msg) => Ok(msg),
+                other => Err(other),
+            }
+        }
+    }
+
+    struct ReadyChild;
+
+    impl Model for ReadyChild {
+        type Msg = ChildMsg;
+
+        fn init(&mut self, _cx: &mut App, _scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+            Command::emit(ChildMsg::Ready)
+        }
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                ChildMsg::Ready => Command::none(),
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    #[derive(Composite)]
+    #[composite(message = Msg)]
+    struct ParentModel {
+        #[child(path = "left", lift = Msg::Left, extract = Msg::into_left)]
+        left: ReadyChild,
+        #[child(path = "right", lift = Msg::Right, extract = Msg::into_right)]
+        right: ReadyChild,
+        trace: Vec<&'static str>,
+    }
+
+    impl Model for ParentModel {
+        type Msg = Msg;
+
+        fn init(&mut self, cx: &mut App, scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+            self.__composite_init(cx, scope)
+        }
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Left(ChildMsg::Ready) => {
+                    self.trace.push("left-ready");
+                    Command::emit(Msg::ParentFollowUp)
+                }
+                Msg::Right(ChildMsg::Ready) => {
+                    self.trace.push("right-ready");
+                    Command::none()
+                }
+                Msg::ParentFollowUp => {
+                    self.trace.push("parent-follow-up");
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let program: Entity<Program<ParentModel>> = cx.update(|cx| {
+        ParentModel {
+            left: ReadyChild,
+            right: ReadyChild,
+            trace: Vec::new(),
+        }
+        .into_program(cx)
+    });
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(
+            program.model().trace,
+            vec!["left-ready", "right-ready", "parent-follow-up"]
+        );
     });
 }
 
@@ -2092,27 +2546,39 @@ fn telemetry_metadata_uses_stable_program_id_and_monotonic_event_ids(cx: &mut Te
             }
         });
 
-    let program: Entity<Program<TelemetryModel>> =
+    let program_a: Entity<Program<TelemetryModel>> =
+        cx.update(|cx| TelemetryModel.into_program_with(config.clone(), cx));
+    let program_b: Entity<Program<TelemetryModel>> =
         cx.update(|cx| TelemetryModel.into_program_with(config, cx));
-    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+    let dispatcher_a = program_a.read_with(cx, |program, _cx| program.dispatcher());
+    let dispatcher_b = program_b.read_with(cx, |program, _cx| program.dispatcher());
 
-    dispatcher.dispatch(Msg::Run).unwrap();
+    dispatcher_a.dispatch(Msg::Run).unwrap();
+    cx.run_until_parked();
+    dispatcher_b.dispatch(Msg::Run).unwrap();
     cx.run_until_parked();
 
     let records = records.lock().unwrap();
     assert!(!records.is_empty());
-    let program_id = records[0].program_id;
-    assert!(records.iter().all(|record| record.program_id == program_id));
+    let mut descriptions_by_program = std::collections::BTreeMap::new();
+    for record in records.iter() {
+        descriptions_by_program
+            .entry(record.program_id)
+            .or_insert_with(Vec::new)
+            .push(record.program_description.clone());
+    }
+    assert_eq!(descriptions_by_program.len(), 2);
     assert!(
         records
             .windows(2)
             .all(|pair| pair[0].event_id < pair[1].event_id)
     );
-    assert!(
-        records
-            .iter()
-            .all(|record| record.program_description.as_deref()
-                == Some(&format!("program:{program_id}")))
-    );
+    for (program_id, descriptions) in descriptions_by_program {
+        assert!(
+            descriptions
+                .iter()
+                .all(|description| description.as_deref() == Some(&format!("program:{program_id}")))
+        );
+    }
     assert!(records.iter().any(|record| record.queue_depth == 0));
 }

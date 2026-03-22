@@ -19,6 +19,7 @@ pub(crate) struct QueuedMessage<Msg> {
 pub(crate) struct MessageQueue<Msg> {
     pub(crate) pending: VecDeque<QueuedMessage<Msg>>,
     pub(crate) is_draining: bool,
+    auto_drain_suspended_depth: usize,
 }
 
 impl<Msg> Default for MessageQueue<Msg> {
@@ -26,7 +27,29 @@ impl<Msg> Default for MessageQueue<Msg> {
         Self {
             pending: VecDeque::new(),
             is_draining: false,
+            auto_drain_suspended_depth: 0,
         }
+    }
+}
+
+impl<Msg> MessageQueue<Msg> {
+    pub(crate) fn suspend_auto_drain(&mut self) {
+        self.auto_drain_suspended_depth = self
+            .auto_drain_suspended_depth
+            .checked_add(1)
+            .expect("auto-drain suspension depth overflow");
+    }
+
+    pub(crate) fn resume_auto_drain(&mut self) {
+        debug_assert!(
+            self.auto_drain_suspended_depth > 0,
+            "auto-drain suspension depth must stay balanced",
+        );
+        self.auto_drain_suspended_depth -= 1;
+    }
+
+    pub(crate) fn should_auto_drain(&self) -> bool {
+        !self.is_draining && self.auto_drain_suspended_depth == 0
     }
 }
 

@@ -46,7 +46,7 @@ pub(crate) struct KeyedEffectContext {
 pub(crate) struct RunningTask {
     pub(crate) generation: TaskGeneration,
     pub(crate) meta: CommandMeta,
-    pub(crate) task: Task<()>,
+    pub(crate) _task: Task<()>,
 }
 
 /// Internal registry for keyed tasks.
@@ -73,7 +73,7 @@ impl KeyedTasks {
             RunningTask {
                 generation,
                 meta,
-                task,
+                _task: task,
             },
         )
     }

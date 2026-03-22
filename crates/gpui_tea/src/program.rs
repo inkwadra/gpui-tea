@@ -5,7 +5,7 @@ use crate::observability::{
     Observability, ProgramConfig, QueueOverflowAction, RuntimeEvent, TelemetryEvent,
 };
 use crate::queue::{QueueReservation, QueueTracker, QueuedMessage};
-use crate::runtime::Runtime;
+use crate::runtime::{EffectId, Runtime};
 use crate::{Command, CommandKind, Dispatcher, Key, ModelContext};
 use futures::StreamExt;
 use gpui::{App, AppContext, AsyncApp, Context, Entity, IntoElement, Render, Task, Window};
@@ -28,6 +28,12 @@ pub struct RuntimeSnapshot {
 pub struct Program<M: Model> {
     model: M,
     runtime: Runtime<M::Msg>,
+}
+
+#[derive(Clone)]
+enum CompletionContext {
+    Keyed(KeyedEffectContext),
+    NonKeyed(EffectId),
 }
 
 impl<M> fmt::Debug for Program<M>
@@ -79,8 +85,8 @@ impl<M: Model> Program<M> {
     /// * `model` - The initial model state.
     /// * `cx` - The GPUI application context.
     ///
-    /// Mounting eagerly calls [`Model::init()`], executes the returned [`Command`], and
-    /// reconciles the initial subscriptions before returning.
+    /// Mounting eagerly calls [`Model::init()`], executes the returned [`Command`] through the
+    /// standard queue-drain model, and reconciles the initial subscriptions before returning.
     ///
     /// # Returns
     ///
@@ -97,8 +103,8 @@ impl<M: Model> Program<M> {
     /// * `config` - The configuration to use for the program runtime.
     /// * `cx` - The GPUI application context.
     ///
-    /// Mounting eagerly calls [`Model::init()`], executes the returned [`Command`], and
-    /// reconciles the initial subscriptions before returning.
+    /// Mounting eagerly calls [`Model::init()`], executes the returned [`Command`] through the
+    /// standard queue-drain model, and reconciles the initial subscriptions before returning.
     ///
     /// # Returns
     ///
@@ -108,8 +114,12 @@ impl<M: Model> Program<M> {
             let runtime = Self::build_runtime(config, cx);
             let mut program = Self { model, runtime };
             let init_command = program.model.init(cx, &ModelContext::root());
-            program.execute_command(init_command, cx);
-            program.reconcile_subscriptions(cx);
+            program.execute_command_transaction(init_command, cx);
+            if program.runtime.queue.pending.is_empty() {
+                program.reconcile_subscriptions(cx);
+            } else {
+                program.drain_queue(cx);
+            }
             program
         })
     }
@@ -153,7 +163,9 @@ impl<M: Model> Program<M> {
 
         self.runtime.queue.pending.push_back(queued);
         self.observe_queue_warning_if_needed();
-        self.drain_queue(cx);
+        if self.runtime.queue.should_auto_drain() {
+            self.drain_queue(cx);
+        }
     }
 
     fn enqueue_message(&mut self, message: M::Msg, cx: &mut Context<'_, Self>) {
@@ -299,7 +311,10 @@ impl<M: Model> Program<M> {
                 let meta = CommandMeta::new(effect.kind(), label);
                 self.observe_command_scheduled(&meta, None);
                 self.observe_effect_started(&meta, None);
-                Self::spawn_effect(effect, meta, None, cx).detach();
+                let effect_id = self.runtime.effects.next_id();
+                let task =
+                    Self::spawn_effect(effect, meta, CompletionContext::NonKeyed(effect_id), cx);
+                self.runtime.effects.insert(effect_id, task);
             }
             CommandInner::Keyed { key, effect } => {
                 let meta = CommandMeta::new(effect.kind(), label);
@@ -310,7 +325,8 @@ impl<M: Model> Program<M> {
                     key: key.clone(),
                     generation,
                 };
-                let task = Self::spawn_effect(effect, meta.clone(), Some(keyed), cx);
+                let task =
+                    Self::spawn_effect(effect, meta.clone(), CompletionContext::Keyed(keyed), cx);
                 let previous =
                     self.runtime
                         .tasks
@@ -319,7 +335,6 @@ impl<M: Model> Program<M> {
                 if let Some(previous) = previous {
                     let previous_kind = previous.meta.kind;
                     let previous_label = previous.meta.label().map(ToOwned::to_owned);
-                    previous.task.detach();
                     self.runtime.observability.observe_runtime(
                         RuntimeEvent::KeyedCommandReplaced {
                             key: &key,
@@ -348,11 +363,20 @@ impl<M: Model> Program<M> {
         }
     }
 
+    fn execute_command_transaction(
+        &mut self,
+        command: Command<M::Msg>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.runtime.queue.suspend_auto_drain();
+        self.execute_command(command, cx);
+        self.runtime.queue.resume_auto_drain();
+    }
+
     fn cancel_keyed_command(&mut self, key: &Key) {
         if let Some(running) = self.runtime.tasks.cancel(key) {
             let canceled_kind = running.meta.kind;
             let canceled_label = running.meta.label().map(ToOwned::to_owned);
-            running.task.detach();
             self.runtime
                 .observability
                 .observe_telemetry(TelemetryEvent::KeyedCommandCanceled {
@@ -436,58 +460,71 @@ impl<M: Model> Program<M> {
         &mut self,
         message: Option<M::Msg>,
         meta: &CommandMeta,
-        keyed: Option<KeyedEffectContext>,
+        context: CompletionContext,
         cx: &mut Context<'_, Self>,
     ) {
-        let key = keyed.as_ref().map(|keyed| &keyed.key);
-        self.observe_effect_completed(meta, key, message.as_ref());
+        match context {
+            CompletionContext::Keyed(keyed) => {
+                let is_current = self.runtime.tasks.is_current(&keyed.key, keyed.generation);
+                if is_current {
+                    self.runtime
+                        .tasks
+                        .clear_current(&keyed.key, keyed.generation);
+                }
 
-        if let Some(keyed) = keyed {
-            if self.runtime.tasks.is_current(&keyed.key, keyed.generation) {
-                self.runtime
-                    .tasks
-                    .clear_current(&keyed.key, keyed.generation);
+                self.observe_effect_completed(meta, Some(&keyed.key), message.as_ref());
+
+                if is_current {
+                    if let Some(message) = message {
+                        self.enqueue_message(message, cx);
+                    }
+                } else {
+                    let key_description = self.runtime.observability.describe_key_value(&keyed.key);
+                    let message_description = message.as_ref().and_then(|message| {
+                        self.runtime.observability.describe_message_value(message)
+                    });
+
+                    self.runtime.observability.observe_runtime(
+                        RuntimeEvent::StaleKeyedCompletionIgnored {
+                            kind: meta.kind,
+                            label: meta.label(),
+                            key: &keyed.key,
+                            key_description: key_description.clone(),
+                            emitted_message: message.is_some(),
+                            message: message.as_ref(),
+                            message_description: message_description.clone(),
+                        },
+                    );
+                    self.runtime.observability.observe_telemetry(
+                        TelemetryEvent::StaleKeyedCompletionIgnored {
+                            kind: meta.kind,
+                            label: meta.label(),
+                            key: &keyed.key,
+                            key_description,
+                            emitted_message: message.is_some(),
+                            message: message.as_ref(),
+                            message_description,
+                        },
+                    );
+                }
+            }
+            CompletionContext::NonKeyed(effect_id) => {
+                let finished = self.runtime.effects.finish(effect_id);
+                debug_assert!(finished, "running non-keyed effect must still be tracked");
+
+                self.observe_effect_completed(meta, None, message.as_ref());
+
                 if let Some(message) = message {
                     self.enqueue_message(message, cx);
                 }
-            } else {
-                let key_description = self.runtime.observability.describe_key_value(&keyed.key);
-                let message_description = message
-                    .as_ref()
-                    .and_then(|message| self.runtime.observability.describe_message_value(message));
-
-                self.runtime.observability.observe_runtime(
-                    RuntimeEvent::StaleKeyedCompletionIgnored {
-                        kind: meta.kind,
-                        label: meta.label(),
-                        key: &keyed.key,
-                        key_description: key_description.clone(),
-                        emitted_message: message.is_some(),
-                        message: message.as_ref(),
-                        message_description: message_description.clone(),
-                    },
-                );
-                self.runtime.observability.observe_telemetry(
-                    TelemetryEvent::StaleKeyedCompletionIgnored {
-                        kind: meta.kind,
-                        label: meta.label(),
-                        key: &keyed.key,
-                        key_description,
-                        emitted_message: message.is_some(),
-                        message: message.as_ref(),
-                        message_description,
-                    },
-                );
             }
-        } else if let Some(message) = message {
-            self.enqueue_message(message, cx);
         }
     }
 
     fn spawn_effect(
         effect: Effect<M::Msg>,
         meta: CommandMeta,
-        keyed: Option<KeyedEffectContext>,
+        context: CompletionContext,
         cx: &mut Context<'_, Self>,
     ) -> Task<()> {
         let program = cx.weak_entity();
@@ -499,7 +536,7 @@ impl<M: Model> Program<M> {
                     let message = effect(&mut async_cx).await;
                     program
                         .update(&mut async_cx, |program, cx| {
-                            program.apply_completion(message, &meta, keyed, cx);
+                            program.apply_completion(message, &meta, context, cx);
                         })
                         .ok();
                 }
@@ -513,7 +550,7 @@ impl<M: Model> Program<M> {
                         let message = executor.spawn(effect(spawned_executor)).await;
                         program
                             .update(&mut async_cx, |program, cx| {
-                                program.apply_completion(message, &meta, keyed, cx);
+                                program.apply_completion(message, &meta, context, cx);
                             })
                             .ok();
                     }
@@ -646,7 +683,7 @@ mod runtime_tests {
             program.apply_completion(
                 Some(Msg::Set(7)),
                 &stale_meta,
-                Some(KeyedEffectContext {
+                CompletionContext::Keyed(KeyedEffectContext {
                     key: key.clone(),
                     generation: new_generation.previous(),
                 }),
@@ -743,7 +780,6 @@ mod runtime_tests {
         #[derive(Clone, Debug, PartialEq, Eq)]
         enum CancelEvent {
             Canceled(Option<String>),
-            Stale(Option<String>),
         }
 
         struct CancelModel {
@@ -790,19 +826,15 @@ mod runtime_tests {
             .describe_key(|key| format!("{key:?}"))
             .telemetry_observer({
                 let events = events.clone();
-                move |envelope| match envelope.event {
-                    TelemetryEvent::KeyedCommandCanceled {
+                move |envelope| {
+                    if let TelemetryEvent::KeyedCommandCanceled {
                         key_description, ..
-                    } => events.lock().unwrap().push(CancelEvent::Canceled(
-                        key_description.map(|value| value.to_string()),
-                    )),
-                    TelemetryEvent::StaleKeyedCompletionIgnored {
-                        message_description,
-                        ..
-                    } => events.lock().unwrap().push(CancelEvent::Stale(
-                        message_description.map(|value| value.to_string()),
-                    )),
-                    _ => {}
+                    } = envelope.event
+                    {
+                        events.lock().unwrap().push(CancelEvent::Canceled(
+                            key_description.map(|value| value.to_string()),
+                        ));
+                    }
                 }
             });
 
@@ -824,8 +856,8 @@ mod runtime_tests {
         dispatcher.dispatch(CancelMsg::RunNext).unwrap();
         cx.run_until_parked();
         dispatcher.dispatch(CancelMsg::RunNext).unwrap();
-        sender.send(8).unwrap();
         cx.run_until_parked();
+        assert_eq!(sender.send(8), Err(8));
 
         program.read_with(cx, |program, _cx| {
             assert!(program.model().values.is_empty());
@@ -833,10 +865,7 @@ mod runtime_tests {
         });
         assert_eq!(
             events.lock().unwrap().as_slice(),
-            &[
-                CancelEvent::Canceled(Some(String::from("Key(\"load\")"))),
-                CancelEvent::Stale(Some(String::from("loaded:8"))),
-            ]
+            &[CancelEvent::Canceled(Some(String::from("Key(\"load\")")))]
         );
     }
 }
