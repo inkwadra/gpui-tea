@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `gpui_tea_macros-v0.1.0`) instead of plain `vX.Y.Z` tags. This changelog uses the shared
 > workspace version heading for readability and links to the canonical `gpui_tea` release tag.
 
-## [Unreleased]
+## [0.1.1] - 2026-03-24
 
 ### Added
 
@@ -44,5 +44,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add runnable examples that demonstrate counters, initialization flows, keyed effects,
   subscriptions, nested models, and telemetry integration.
 
-[unreleased]: https://github.com/inkwadra/gpui-tea/compare/gpui_tea-v0.1.0...HEAD
+[unreleased]: https://github.com/inkwadra/gpui-tea/compare/gpui_tea-v0.1.1...HEAD
+[0.1.1]: https://github.com/inkwadra/gpui-tea/releases/tag/gpui_tea-v0.1.1
 [0.1.0]: https://github.com/inkwadra/gpui-tea/releases/tag/gpui_tea-v0.1.0
