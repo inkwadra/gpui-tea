@@ -2277,7 +2277,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_tea"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "gpui",
@@ -2291,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_tea_macros"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proc-macro2",
  "quote",

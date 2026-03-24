@@ -62,10 +62,9 @@ fn composite_derive_span(attrs: &[Attribute]) -> Span {
                 Ok(())
             })
             .is_ok()
+            && let Some(span) = derive_span
         {
-            if let Some(span) = derive_span {
-                return span;
-            }
+            return span;
         }
     }
 
