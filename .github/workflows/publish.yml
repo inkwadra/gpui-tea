@@ -18,11 +18,31 @@ jobs:
       - name: Parse tag
         id: tag
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          CRATE="${TAG%-v*}"
-          VERSION="${TAG#*-v}"
+          TAG="${{ github.ref_name }}"
+          if [[ "$TAG" =~ ^(gpui_tea|gpui_tea_macros)-v(.*)$ ]]; then
+            CRATE="${BASH_REMATCH[1]}"
+            VERSION="${BASH_REMATCH[2]}"
+          else
+            echo "Error: Unrecognized tag format: '$TAG'; expected 'gpui_tea-v*' or 'gpui_tea_macros-v*'"
+            exit 1
+          fi
           echo "crate=$CRATE" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Validate tag version against Cargo.toml
+        run: |
+          CRATE="${{ steps.tag.outputs.crate }}"
+          TAG_VERSION="${{ steps.tag.outputs.version }}"
+          CARGO_VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r ".packages[] | select(.name == \"$CRATE\") | .version")
+          if [ -z "$CARGO_VERSION" ]; then
+            echo "Error: Crate '$CRATE' not found in workspace"
+            exit 1
+          fi
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "Error: Tag version '$TAG_VERSION' does not match Cargo.toml version '$CARGO_VERSION' for crate '$CRATE'"
+            exit 1
+          fi
+          echo "Verified tag version matches Cargo.toml: $CRATE v$TAG_VERSION"
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -50,6 +70,27 @@ jobs:
 
       - name: Cache cargo artifacts
         uses: swatinem/rust-cache@v2
+
+      - name: Install repository tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just,typos-cli@1.44.0
+
+      - name: Run quality gate
+        run: just qa
+
+      - name: Verify macro dependency publication
+        if: steps.tag.outputs.crate == 'gpui_tea'
+        run: |
+          MACRO_REQ=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "gpui_tea") | .dependencies[] | select(.name == "gpui_tea_macros") | .req')
+          MACRO_VER=$(echo "$MACRO_REQ" | tr -d '^=~ ')
+          echo "gpui_tea requires gpui_tea_macros version: $MACRO_VER"
+          if curl -s -f "https://index.crates.io/gp/ui/gpui_tea_macros" | grep -q "\"vers\":\"$MACRO_VER\""; then
+            echo "gpui_tea_macros v$MACRO_VER is available on crates.io"
+          else
+            echo "Error: gpui_tea_macros v$MACRO_VER is not available on crates.io yet. You must publish gpui_tea_macros before gpui_tea."
+            exit 1
+          fi
 
       - name: Dry-run package verification
         run: cargo publish -p "${{ steps.tag.outputs.crate }}" --dry-run
