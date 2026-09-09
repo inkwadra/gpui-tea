@@ -32,6 +32,11 @@ impl<Msg: Send + 'static> Dispatcher<Msg> {
 
                 match reservation {
                     QueueReservation::Rejected => {
+                        observability.observe_runtime(RuntimeEvent::QueueOverflow {
+                            policy: observability.queue_policy(),
+                            action: QueueOverflowAction::RejectedNew,
+                            message_description: message_description.clone(),
+                        });
                         observability.observe_telemetry(TelemetryEvent::QueueOverflow {
                             policy: observability.queue_policy(),
                             action: QueueOverflowAction::RejectedNew,
@@ -42,6 +47,11 @@ impl<Msg: Send + 'static> Dispatcher<Msg> {
                         })
                     }
                     QueueReservation::DroppedNewest => {
+                        observability.observe_runtime(RuntimeEvent::QueueOverflow {
+                            policy: observability.queue_policy(),
+                            action: QueueOverflowAction::DroppedNewest,
+                            message_description: message_description.clone(),
+                        });
                         observability.observe_telemetry(TelemetryEvent::QueueOverflow {
                             policy: observability.queue_policy(),
                             action: QueueOverflowAction::DroppedNewest,
@@ -60,6 +70,11 @@ impl<Msg: Send + 'static> Dispatcher<Msg> {
 
                         if let Ok(()) = &result {
                             if let Some(action) = overflow_action {
+                                observability.observe_runtime(RuntimeEvent::QueueOverflow {
+                                    policy: observability.queue_policy(),
+                                    action,
+                                    message_description: message_description.clone(),
+                                });
                                 observability.observe_telemetry(TelemetryEvent::QueueOverflow {
                                     policy: observability.queue_policy(),
                                     action,
@@ -102,10 +117,12 @@ impl<Msg: Send + 'static> Dispatcher<Msg> {
     ///
     /// # Returns
     ///
-    /// A [`Result`] indicating success or failure of dispatching the message. Under
-    /// [`crate::QueuePolicy::DropNewest`] this may still return `Ok(())` even though the new
-    /// message was discarded, and under [`crate::QueuePolicy::DropOldest`] it may succeed after
-    /// displacing the oldest queued message.
+    /// A [`Result`] indicating success or failure of dispatching the message.
+    ///
+    /// Under [`crate::QueuePolicy::DropNewest`] this may still return `Ok(())` even though the new
+    /// message was discarded — check runtime/telemetry `QueueOverflow` events if you need to
+    /// observe drops. Under [`crate::QueuePolicy::DropOldest`] it may succeed after displacing
+    /// the oldest queued message.
     pub fn dispatch(&self, msg: Msg) -> Result<()> {
         (self.dispatch)(msg)
     }

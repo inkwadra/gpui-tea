@@ -4,7 +4,7 @@ use crate::model::Model;
 use crate::observability::{
     Observability, ProgramConfig, QueueOverflowAction, RuntimeEvent, TelemetryEvent,
 };
-use crate::queue::{QueueReservation, QueueTracker, QueuedMessage};
+use crate::queue::{AutoDrainGuard, DrainGuard, QueueReservation, QueueTracker, QueuedMessage};
 use crate::runtime::{EffectId, Runtime};
 use crate::{Command, CommandKind, Dispatcher, Key, ModelContext};
 use futures::StreamExt;
@@ -141,7 +141,7 @@ impl<M: Model> Program<M> {
     pub fn runtime_snapshot(&self) -> RuntimeSnapshot {
         RuntimeSnapshot {
             queue_depth: self.runtime.queue_tracker.depth(),
-            is_draining: self.runtime.queue.is_draining,
+            is_draining: self.runtime.queue.is_draining(),
             active_keyed_tasks: self.runtime.tasks.len(),
             active_subscriptions: self.runtime.subscriptions.len(),
         }
@@ -176,6 +176,13 @@ impl<M: Model> Program<M> {
             QueueReservation::Rejected => {
                 self.runtime
                     .observability
+                    .observe_runtime(RuntimeEvent::QueueOverflow {
+                        policy: self.runtime.observability.queue_policy(),
+                        action: QueueOverflowAction::RejectedNew,
+                        message_description: message_description.clone(),
+                    });
+                self.runtime
+                    .observability
                     .observe_telemetry(TelemetryEvent::QueueOverflow {
                         policy: self.runtime.observability.queue_policy(),
                         action: QueueOverflowAction::RejectedNew,
@@ -183,6 +190,13 @@ impl<M: Model> Program<M> {
                     });
             }
             QueueReservation::DroppedNewest => {
+                self.runtime
+                    .observability
+                    .observe_runtime(RuntimeEvent::QueueOverflow {
+                        policy: self.runtime.observability.queue_policy(),
+                        action: QueueOverflowAction::DroppedNewest,
+                        message_description: message_description.clone(),
+                    });
                 self.runtime
                     .observability
                     .observe_telemetry(TelemetryEvent::QueueOverflow {
@@ -197,6 +211,13 @@ impl<M: Model> Program<M> {
                 ..
             } => {
                 if let Some(action) = overflow_action {
+                    self.runtime
+                        .observability
+                        .observe_runtime(RuntimeEvent::QueueOverflow {
+                            policy: self.runtime.observability.queue_policy(),
+                            action,
+                            message_description: message_description.clone(),
+                        });
                     self.runtime
                         .observability
                         .observe_telemetry(TelemetryEvent::QueueOverflow {
@@ -226,11 +247,11 @@ impl<M: Model> Program<M> {
     }
 
     fn drain_queue(&mut self, cx: &mut Context<'_, Self>) {
-        if self.runtime.queue.is_draining {
+        if self.runtime.queue.is_draining() {
             return;
         }
 
-        self.runtime.queue.is_draining = true;
+        let drain_guard = DrainGuard::start(&self.runtime.queue);
         let queued = self.runtime.queue.pending.len();
         self.runtime
             .observability
@@ -269,7 +290,7 @@ impl<M: Model> Program<M> {
             self.execute_command(command, cx);
         }
 
-        self.runtime.queue.is_draining = false;
+        drop(drain_guard);
 
         if processed > 0 {
             self.reconcile_subscriptions(cx);
@@ -368,9 +389,9 @@ impl<M: Model> Program<M> {
         command: Command<M::Msg>,
         cx: &mut Context<'_, Self>,
     ) {
-        self.runtime.queue.suspend_auto_drain();
+        let auto_drain_guard = AutoDrainGuard::suspend(&self.runtime.queue);
         self.execute_command(command, cx);
-        self.runtime.queue.resume_auto_drain();
+        drop(auto_drain_guard);
     }
 
     fn cancel_keyed_command(&mut self, key: &Key) {
@@ -470,11 +491,7 @@ impl<M: Model> Program<M> {
                     self.runtime
                         .tasks
                         .clear_current(&keyed.key, keyed.generation);
-                }
-
-                self.observe_effect_completed(meta, Some(&keyed.key), message.as_ref());
-
-                if is_current {
+                    self.observe_effect_completed(meta, Some(&keyed.key), message.as_ref());
                     if let Some(message) = message {
                         self.enqueue_message(message, cx);
                     }

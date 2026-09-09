@@ -1,7 +1,10 @@
 use crate::observability::{QueueOverflowAction, QueuePolicy};
 use std::{
     collections::{HashSet, VecDeque},
-    sync::Mutex,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -16,40 +19,79 @@ pub(crate) struct QueuedMessage<Msg> {
 }
 
 /// Internal message queue.
+///
+/// Control flags use shared atomics so RAII guards can restore them on panic without
+/// holding a borrow of the queue (which would conflict with nested `&mut` access).
 pub(crate) struct MessageQueue<Msg> {
     pub(crate) pending: VecDeque<QueuedMessage<Msg>>,
-    pub(crate) is_draining: bool,
-    auto_drain_suspended_depth: usize,
+    is_draining: Arc<AtomicBool>,
+    auto_drain_suspended_depth: Arc<AtomicUsize>,
 }
 
 impl<Msg> Default for MessageQueue<Msg> {
     fn default() -> Self {
         Self {
             pending: VecDeque::new(),
-            is_draining: false,
-            auto_drain_suspended_depth: 0,
+            is_draining: Arc::new(AtomicBool::new(false)),
+            auto_drain_suspended_depth: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
 
 impl<Msg> MessageQueue<Msg> {
-    pub(crate) fn suspend_auto_drain(&mut self) {
-        self.auto_drain_suspended_depth = self
-            .auto_drain_suspended_depth
-            .checked_add(1)
-            .expect("auto-drain suspension depth overflow");
-    }
-
-    pub(crate) fn resume_auto_drain(&mut self) {
-        debug_assert!(
-            self.auto_drain_suspended_depth > 0,
-            "auto-drain suspension depth must stay balanced",
-        );
-        self.auto_drain_suspended_depth -= 1;
+    pub(crate) fn is_draining(&self) -> bool {
+        self.is_draining.load(Ordering::Acquire)
     }
 
     pub(crate) fn should_auto_drain(&self) -> bool {
-        !self.is_draining && self.auto_drain_suspended_depth == 0
+        !self.is_draining() && self.auto_drain_suspended_depth.load(Ordering::Acquire) == 0
+    }
+}
+
+/// Restore auto-drain suspension depth even if the guarded body panics.
+pub(crate) struct AutoDrainGuard {
+    depth: Arc<AtomicUsize>,
+}
+
+impl AutoDrainGuard {
+    pub(crate) fn suspend<Msg>(queue: &MessageQueue<Msg>) -> Self {
+        let depth = queue.auto_drain_suspended_depth.clone();
+        let previous = depth.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            previous < usize::MAX,
+            "auto-drain suspension depth overflow"
+        );
+        Self { depth }
+    }
+}
+
+impl Drop for AutoDrainGuard {
+    fn drop(&mut self) {
+        self.depth
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                Some(value.saturating_sub(1))
+            })
+            .ok();
+    }
+}
+
+/// Clear `is_draining` even if the guarded body panics.
+pub(crate) struct DrainGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl DrainGuard {
+    pub(crate) fn start<Msg>(queue: &MessageQueue<Msg>) -> Self {
+        queue.is_draining.store(true, Ordering::Release);
+        Self {
+            flag: queue.is_draining.clone(),
+        }
+    }
+}
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
     }
 }
 
@@ -111,12 +153,29 @@ impl QueueControl {
         }
 
         match self.policy {
-            QueuePolicy::Unbounded => unreachable!("unbounded queues return early"),
+            QueuePolicy::Unbounded => {
+                let id = self.next_id();
+                self.active.push_back(id);
+                QueueReservation::Accepted {
+                    id,
+                    overflow_action: None,
+                    displaced: None,
+                }
+            }
             QueuePolicy::RejectNew { .. } => QueueReservation::Rejected,
             QueuePolicy::DropNewest { .. } => QueueReservation::DroppedNewest,
             QueuePolicy::DropOldest { .. } => {
+                // capacity == 0 (or a temporarily empty queue at capacity) still accepts by
+                // displacing the oldest entry when one exists; with nothing to displace the
+                // newest message is kept so DropOldest never silently drops everything.
                 let Some(oldest) = self.active.pop_front() else {
-                    return QueueReservation::DroppedNewest;
+                    let id = self.next_id();
+                    self.active.push_back(id);
+                    return QueueReservation::Accepted {
+                        id,
+                        overflow_action: None,
+                        displaced: None,
+                    };
                 };
                 self.dropped.insert(oldest);
                 let id = self.next_id();
@@ -198,5 +257,74 @@ impl QueueTracker {
 
     pub(crate) fn depth(&self) -> usize {
         self.control.lock().unwrap().depth()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observability::QueuePolicy;
+
+    #[test]
+    fn drop_oldest_capacity_zero_accepts_when_nothing_to_displace() {
+        let tracker = QueueTracker::new(QueuePolicy::DropOldest { capacity: 0 });
+        let reservation = tracker.reserve_enqueue();
+        assert!(matches!(
+            reservation,
+            QueueReservation::Accepted {
+                overflow_action: None,
+                displaced: None,
+                ..
+            }
+        ));
+        assert_eq!(tracker.depth(), 1);
+    }
+
+    #[test]
+    fn drop_oldest_capacity_zero_displaces_previous_entry() {
+        let tracker = QueueTracker::new(QueuePolicy::DropOldest { capacity: 0 });
+        let first = tracker.reserve_enqueue();
+        let second = tracker.reserve_enqueue();
+
+        let QueueReservation::Accepted { id: first_id, .. } = first else {
+            panic!("first reservation must be accepted");
+        };
+        assert!(matches!(
+            second,
+            QueueReservation::Accepted {
+                overflow_action: Some(QueueOverflowAction::DroppedOldest),
+                ..
+            }
+        ));
+        assert!(tracker.take_if_dropped(first_id));
+        assert_eq!(tracker.depth(), 1);
+    }
+
+    #[test]
+    fn drain_guard_resets_flag_on_drop() {
+        let queue = MessageQueue::<()>::default();
+        assert!(!queue.is_draining());
+        {
+            let _guard = DrainGuard::start(&queue);
+            assert!(queue.is_draining());
+            assert!(!queue.should_auto_drain());
+        }
+        assert!(!queue.is_draining());
+        assert!(queue.should_auto_drain());
+    }
+
+    #[test]
+    fn auto_drain_guard_resets_depth_on_drop() {
+        let queue = MessageQueue::<()>::default();
+        assert!(queue.should_auto_drain());
+        {
+            let _outer = AutoDrainGuard::suspend(&queue);
+            {
+                let _inner = AutoDrainGuard::suspend(&queue);
+                assert!(!queue.should_auto_drain());
+            }
+            assert!(!queue.should_auto_drain());
+        }
+        assert!(queue.should_auto_drain());
     }
 }

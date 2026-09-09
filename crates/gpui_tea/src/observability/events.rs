@@ -80,6 +80,8 @@ pub enum TelemetryEvent<'a, Msg> {
         key_description: Option<Arc<str>>,
     },
     /// An asynchronous effect started running.
+    ///
+    /// This event is emitted only in telemetry, not in [`RuntimeEvent`].
     EffectStarted {
         /// Classify the effect execution kind.
         kind: CommandKind,
@@ -209,9 +211,21 @@ pub enum RuntimeEvent<'a, Msg> {
         /// Hold the optional human-readable description for the dispatched message.
         message_description: Option<Arc<str>>,
     },
-    /// A dispatch call could not be delivered to the runtime.
+    /// A dispatch call could not be delivered because the program is gone.
     DispatchRejected {
         /// Hold the optional human-readable description for the dispatched message.
+        message_description: Option<Arc<str>>,
+    },
+    /// Queue capacity handling was triggered while dispatching or enqueuing a message.
+    ///
+    /// Emitted for both the runtime and telemetry observers so backpressure is visible
+    /// without requiring the telemetry pipeline.
+    QueueOverflow {
+        /// Identify the active queue policy.
+        policy: QueuePolicy,
+        /// Describe the action taken by the policy.
+        action: QueueOverflowAction,
+        /// Hold the optional human-readable description for the affected message.
         message_description: Option<Arc<str>>,
     },
     /// Queue draining started for the current batch of pending messages.
