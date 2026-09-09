@@ -15,11 +15,11 @@ categories = ["development-tools", "gui"]
 
 [workspace.dependencies]
 futures = "0.3.32"
-gpui = { version = "0.2.2", features = ["test-support"] }
+gpui = "0.2.2"
 metrics = "0.24.2"
 proc-macro2 = "1.0.95"
 quote = "1.0.40"
-syn = { version = "2.0.104", features = ["full", "parsing"] }
+syn = { version = "2.0.104", default-features = false, features = ["derive", "parsing", "printing", "clone-impls", "proc-macro"] }
 thiserror = "2.0.17"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }

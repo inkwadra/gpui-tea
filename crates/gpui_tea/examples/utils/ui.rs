@@ -29,7 +29,7 @@ const CARD_WIDTH: f32 = 560.0;
 const DETAIL_VALUE_WIDTH: f32 = 220.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ButtonVariant {
+pub(crate) enum ButtonVariant {
     Primary,
     Secondary,
     Outline,
@@ -37,14 +37,14 @@ pub enum ButtonVariant {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ControlSize {
+pub(crate) enum ControlSize {
     Sm,
     Md,
     Lg,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TextRole {
+pub(crate) enum TextRole {
     Eyebrow,
     Title,
     Body,
@@ -53,14 +53,14 @@ pub enum TextRole {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SurfaceTone {
+pub(crate) enum SurfaceTone {
     Base,
     Elevated,
     Inset,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BannerTone {
+pub(crate) enum BannerTone {
     Neutral,
     Info,
     Success,
@@ -418,18 +418,18 @@ fn text_style(role: TextRole) -> TextStyleSpec {
 }
 
 #[derive(IntoElement)]
-pub struct AppFrame {
+pub(crate) struct AppFrame {
     children: Vec<AnyElement>,
 }
 
 impl AppFrame {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             children: Vec::new(),
         }
     }
 
-    pub fn child(mut self, child: impl IntoElement) -> Self {
+    pub(crate) fn child(mut self, child: impl IntoElement) -> Self {
         self.children.push(child.into_any_element());
         self
     }
@@ -457,25 +457,25 @@ impl RenderOnce for AppFrame {
 }
 
 #[derive(IntoElement)]
-pub struct Card {
+pub(crate) struct Card {
     tone: SurfaceTone,
     children: Vec<AnyElement>,
 }
 
 impl Card {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tone: SurfaceTone::Elevated,
             children: Vec::new(),
         }
     }
 
-    pub fn tone(mut self, tone: SurfaceTone) -> Self {
+    pub(crate) fn tone(mut self, tone: SurfaceTone) -> Self {
         self.tone = tone;
         self
     }
 
-    pub fn child(mut self, child: impl IntoElement) -> Self {
+    pub(crate) fn child(mut self, child: impl IntoElement) -> Self {
         self.children.push(child.into_any_element());
         self
     }
@@ -509,13 +509,13 @@ impl RenderOnce for Card {
 }
 
 #[derive(IntoElement)]
-pub struct Text {
+pub(crate) struct Text {
     role: TextRole,
     content: SharedString,
 }
 
 impl Text {
-    pub fn new(role: TextRole, content: impl Into<SharedString>) -> Self {
+    pub(crate) fn new(role: TextRole, content: impl Into<SharedString>) -> Self {
         Self {
             role,
             content: content.into(),
@@ -537,12 +537,12 @@ impl RenderOnce for Text {
 }
 
 #[derive(IntoElement)]
-pub struct Metric {
+pub(crate) struct Metric {
     content: SharedString,
 }
 
 impl Metric {
-    pub fn new(content: impl Into<SharedString>) -> Self {
+    pub(crate) fn new(content: impl Into<SharedString>) -> Self {
         Self {
             content: content.into(),
         }
@@ -556,13 +556,13 @@ impl RenderOnce for Metric {
 }
 
 #[derive(IntoElement)]
-pub struct DetailRow {
+pub(crate) struct DetailRow {
     label: SharedString,
     value: SharedString,
 }
 
 impl DetailRow {
-    pub fn new(label: impl Into<SharedString>, value: impl Into<SharedString>) -> Self {
+    pub(crate) fn new(label: impl Into<SharedString>, value: impl Into<SharedString>) -> Self {
         Self {
             label: label.into(),
             value: value.into(),
@@ -605,20 +605,20 @@ impl RenderOnce for DetailRow {
 }
 
 #[derive(IntoElement)]
-pub struct Banner {
+pub(crate) struct Banner {
     tone: BannerTone,
     content: SharedString,
 }
 
 impl Banner {
-    pub fn new(content: impl Into<SharedString>) -> Self {
+    pub(crate) fn new(content: impl Into<SharedString>) -> Self {
         Self {
             tone: BannerTone::Neutral,
             content: content.into(),
         }
     }
 
-    pub fn tone(mut self, tone: BannerTone) -> Self {
+    pub(crate) fn tone(mut self, tone: BannerTone) -> Self {
         self.tone = tone;
         self
     }
@@ -646,20 +646,20 @@ impl RenderOnce for Banner {
 }
 
 #[derive(IntoElement)]
-pub struct Badge {
+pub(crate) struct Badge {
     tone: BannerTone,
     content: SharedString,
 }
 
 impl Badge {
-    pub fn new(content: impl Into<SharedString>) -> Self {
+    pub(crate) fn new(content: impl Into<SharedString>) -> Self {
         Self {
             tone: BannerTone::Neutral,
             content: content.into(),
         }
     }
 
-    pub fn tone(mut self, tone: BannerTone) -> Self {
+    pub(crate) fn tone(mut self, tone: BannerTone) -> Self {
         self.tone = tone;
         self
     }
@@ -692,7 +692,7 @@ impl RenderOnce for Badge {
     }
 }
 
-pub struct Button {
+pub(crate) struct Button {
     id: SharedString,
     label: SharedString,
     variant: ButtonVariant,
@@ -700,7 +700,7 @@ pub struct Button {
 }
 
 impl Button {
-    pub fn new(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Self {
+    pub(crate) fn new(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Self {
         Self {
             id: id.into(),
             label: label.into(),
@@ -709,17 +709,17 @@ impl Button {
         }
     }
 
-    pub fn variant(mut self, variant: ButtonVariant) -> Self {
+    pub(crate) fn variant(mut self, variant: ButtonVariant) -> Self {
         self.variant = variant;
         self
     }
 
-    pub fn size(mut self, size: ControlSize) -> Self {
+    pub(crate) fn size(mut self, size: ControlSize) -> Self {
         self.size = size;
         self
     }
 
-    pub fn build(self) -> Stateful<Div> {
+    pub(crate) fn build(self) -> Stateful<Div> {
         let enabled = button_palette(self.variant);
         let hovered = hovered_button_palette(self.variant);
         let active = active_button_palette(self.variant);
@@ -764,6 +764,6 @@ impl Button {
     }
 }
 
-pub fn action_row() -> Div {
+pub(crate) fn action_row() -> Div {
     div().flex().gap(px(SPACE_2))
 }

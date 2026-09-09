@@ -13,7 +13,7 @@ readme = "../../README.md"
 keywords.workspace = true
 categories.workspace = true
 description = "Runtime primitives for building Elm-style GPUI applications."
-include = ["src/**", "examples/**", "tests/**", "Cargo.toml", "../../README.md", "../../LICENSE"]
+include = ["src/**", "examples/**", "tests/**", "Cargo.toml"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -22,7 +22,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = []
 metrics = ["dep:metrics"]
-tracing = ["dep:tracing", "dep:tracing-subscriber"]
+tracing = ["dep:tracing"]
 
 [dependencies]
 futures.workspace = true
@@ -31,9 +31,10 @@ gpui_tea_macros = { version = "0.1.1", path = "../gpui_tea_macros" }
 metrics = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing = { workspace = true, optional = true }
-tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+tracing-subscriber.workspace = true
 trybuild.workspace = true
 
 [lints]
