@@ -35,7 +35,11 @@ check:
     cargo check --workspace --all-targets --all-features
 
 clippy:
-    cargo clippy --workspace --all-targets --all-features -- -D clippy::all -D clippy::cargo -A clippy::multiple-crate-versions
+    cargo clippy --workspace --all-targets --all-features -- \
+        -D missing_docs \
+        -D clippy::all \
+        -D clippy::cargo \
+        -A clippy::multiple-crate-versions
 
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
@@ -52,6 +56,7 @@ lint:
 
 qa:
     just metadata
+    just package
     just fmt-check
     just check
     just lint

@@ -26,9 +26,33 @@ jobs:
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            clang \
+            lld \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libvulkan1 \
+            libfontconfig-dev \
+            libzstd-dev \
+            libssl-dev \
+            libasound2-dev \
+            libsqlite3-dev
 
       - name: Cache cargo artifacts
         uses: swatinem/rust-cache@v2
+
+      - name: Dry-run package verification
+        run: cargo publish -p "${{ steps.tag.outputs.crate }}" --dry-run
 
       - name: Publish ${{ steps.tag.outputs.crate }}
         env:
