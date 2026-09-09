@@ -32,6 +32,14 @@ pub trait Model: Sized + 'static {
     ) -> View;
 
     /// Describe the long-lived event sources required by this model.
+    ///
+    /// The runtime diffs the returned set against the previous one **by key**:
+    /// - keys that disappeared are dropped (handles released),
+    /// - new keys have their builders run,
+    /// - keys that remain keep the previously built resource and do **not** re-run the builder.
+    ///
+    /// Put identity that should rebuild the resource into the [`crate::Key`]
+    /// (or omit/re-add the key), not only into the builder closure captures.
     fn subscriptions(
         &self,
         _cx: &mut App,

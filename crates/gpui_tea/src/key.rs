@@ -42,6 +42,10 @@ impl Key {
     }
 
     /// Return a new key scoped to the provided path.
+    ///
+    /// Scoping is applied at most once: if this key already carries a child path, the call is a
+    /// no-op. Nested models therefore compose the full path when creating the child
+    /// [`crate::ChildScope`], not by stacking multiple `scoped` calls.
     pub(crate) fn scoped(&self, path: &ChildPath) -> Self {
         if path.is_root() || self.child_path.is_some() {
             return self.clone();

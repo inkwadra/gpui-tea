@@ -29,8 +29,7 @@ impl fmt::Debug for SubHandle {
 }
 
 /// A closure type for building a subscription context.
-type SubscriptionBuilder<Msg> =
-    Box<dyn for<'a> FnOnce(&'a mut SubscriptionContext<'a, Msg>) -> SubHandle>;
+type SubscriptionBuilder<Msg> = Box<dyn FnOnce(&mut SubscriptionContext<'_, Msg>) -> SubHandle>;
 
 #[must_use]
 /// Expose runtime services while constructing a [`Subscription`].
@@ -100,6 +99,20 @@ impl<Msg> fmt::Debug for SubscriptionContext<'_, Msg> {
 /// The runtime reconciles subscriptions by [`Key`], retaining existing resources whose keys are
 /// still present and building new resources for newly introduced keys. Keys must be unique within
 /// a [`Subscriptions`] set.
+///
+/// # Retained subscriptions ignore new builders
+///
+/// Reconciliation is a set-diff on keys only. If a key remains present across
+/// [`Model::subscriptions()`](crate::Model::subscriptions) calls, the runtime keeps the **already
+/// running** resource and does **not** re-run the builder, even if the new closure captures
+/// different state (URL, entity id, query, and so on).
+///
+/// To change the live resource, either:
+/// - use a different [`Key`] when the captured inputs change, or
+/// - omit the old key for one reconciliation (so it is removed) and re-add it with the new builder.
+///
+/// Updating `.label()` on a retained subscription only affects observability output; it does not
+/// rebuild the resource.
 pub struct Subscription<Msg: 'static> {
     pub(crate) key: Key,
     pub(crate) label: Option<Arc<str>>,
@@ -122,7 +135,7 @@ impl<Msg: Send + 'static> Subscription<Msg> {
     /// A new [`Subscription`].
     pub fn new<F>(key: impl Into<Key>, builder: F) -> Self
     where
-        F: for<'a> FnOnce(&'a mut SubscriptionContext<'a, Msg>) -> SubHandle + 'static,
+        F: FnOnce(&mut SubscriptionContext<'_, Msg>) -> SubHandle + 'static,
     {
         Self {
             key: key.into(),
@@ -210,10 +223,15 @@ impl<Msg: Send + 'static> Subscriptions<Msg> {
     /// Create a subscription set from an iterable of unique subscriptions.
     fn from_unique_iter(subscriptions: impl IntoIterator<Item = Subscription<Msg>>) -> Self {
         let subscriptions: Vec<_> = subscriptions.into_iter().collect();
-        let keys = subscriptions
+        let keys: HashSet<Key> = subscriptions
             .iter()
             .map(|subscription| subscription.key.clone())
             .collect();
+        debug_assert_eq!(
+            keys.len(),
+            subscriptions.len(),
+            "from_unique_iter requires unique subscription keys"
+        );
         Self {
             subscriptions,
             keys,

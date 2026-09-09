@@ -109,6 +109,9 @@ impl<Msg> ProgramConfig<Msg> {
     }
 
     /// Emit queue warning events whenever the current queue depth is greater than `threshold`.
+    ///
+    /// Warnings are level-triggered: every enqueue that keeps the depth above the threshold emits
+    /// another event. Use a higher threshold or filter events if a burst would be too noisy.
     pub fn queue_warning_threshold(mut self, threshold: usize) -> Self {
         self.queue_warning_threshold = Some(threshold);
         self

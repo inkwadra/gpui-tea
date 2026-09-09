@@ -24,6 +24,10 @@ pub(crate) struct SubscriptionReconcileStats {
 }
 
 impl SubscriptionRegistry {
+    /// Diff `subscriptions` against the active set by key.
+    ///
+    /// Removed keys drop their handles first so a replacement key can rebuild immediately without
+    /// double-subscribing. Retained keys keep the previous handle and do not re-run the builder.
     pub(crate) fn reconcile<Msg: Send + 'static, T: 'static>(
         &mut self,
         subscriptions: Subscriptions<Msg>,
