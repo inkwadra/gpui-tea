@@ -1,0 +1,5 @@
+error: `Composite` does not support enums
+ --> tests/ui/enum_composite.rs:7:1
+  |
+7 | enum Parent {
+  | ^^^^

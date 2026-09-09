@@ -1,0 +1,5 @@
+error: `Composite` does not support unions; use a struct with named fields
+ --> tests/ui/union_composite.rs:7:1
+  |
+7 | union Parent {
+  | ^^^^^

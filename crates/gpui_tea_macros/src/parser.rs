@@ -88,11 +88,28 @@ fn parse_message_type(attrs: &[Attribute], missing_message_span: Span) -> Result
     let mut errors = None;
 
     for attr in attrs {
+        if attr.path().is_ident("child") {
+            combine_error(
+                &mut errors,
+                Error::new(
+                    attr.span(),
+                    "`#[child]` attribute is not supported on structs; place it on named child fields instead",
+                ),
+            );
+            continue;
+        }
+
         if !attr.path().is_ident("composite") {
             continue;
         }
 
-        let metas = attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
+        let metas = match attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated) {
+            Ok(metas) => metas,
+            Err(error) => {
+                combine_error(&mut errors, error);
+                continue;
+            }
+        };
         for meta in metas {
             parse_composite_meta(meta, &mut message_ty, &mut errors);
         }
@@ -218,12 +235,29 @@ fn parse_child(field: Field) -> Result<Option<ChildSpec>> {
     let mut errors = None;
 
     for attr in &field.attrs {
+        if attr.path().is_ident("composite") {
+            combine_error(
+                &mut errors,
+                Error::new(
+                    attr.span(),
+                    "`#[composite]` attribute is not supported on fields; place it on the struct instead",
+                ),
+            );
+            continue;
+        }
+
         if !attr.path().is_ident("child") {
             continue;
         }
 
         saw_child = true;
-        let metas = attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
+        let metas = match attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated) {
+            Ok(metas) => metas,
+            Err(error) => {
+                combine_error(&mut errors, error);
+                continue;
+            }
+        };
         for meta in metas {
             parse_child_meta(
                 meta,
@@ -237,6 +271,9 @@ fn parse_child(field: Field) -> Result<Option<ChildSpec>> {
     }
 
     if !saw_child {
+        if let Some(error) = errors {
+            return Err(error);
+        }
         return Ok(None);
     }
 
@@ -592,6 +629,137 @@ mod tests {
         assert_eq!(
             parse_error(input).to_string(),
             "unsupported `composite` attribute"
+        );
+    }
+
+    #[test]
+    fn rejects_child_attribute_on_struct() {
+        let input: DeriveInput = parse_quote! {
+            #[derive(Composite)]
+            #[child(path = "child", lift = ParentMsg::Child, extract = ParentMsg::into_child)]
+            #[composite(message = ParentMsg)]
+            struct Parent {
+                child: ChildModel,
+            }
+        };
+
+        assert_eq!(
+            parse_error(input).to_string(),
+            "`#[child]` attribute is not supported on structs; place it on named child fields instead"
+        );
+    }
+
+    #[test]
+    fn rejects_composite_attribute_on_field() {
+        let input: DeriveInput = parse_quote! {
+            #[derive(Composite)]
+            #[composite(message = ParentMsg)]
+            struct Parent {
+                #[composite(message = ParentMsg)]
+                child: ChildModel,
+            }
+        };
+
+        assert_eq!(
+            parse_error(input).to_string(),
+            "`#[composite]` attribute is not supported on fields; place it on the struct instead"
+        );
+    }
+
+    #[test]
+    fn rejects_enums() {
+        let input: DeriveInput = parse_quote! {
+            #[derive(Composite)]
+            #[composite(message = ParentMsg)]
+            enum Parent {
+                Child(ChildModel),
+            }
+        };
+
+        assert_eq!(
+            parse_error(input).to_string(),
+            "`Composite` does not support enums"
+        );
+    }
+
+    #[test]
+    fn rejects_unions() {
+        let input: DeriveInput = parse_quote! {
+            #[derive(Composite)]
+            #[composite(message = ParentMsg)]
+            union Parent {
+                child: usize,
+            }
+        };
+
+        assert_eq!(
+            parse_error(input).to_string(),
+            "`Composite` does not support unions; use a struct with named fields"
+        );
+    }
+
+    #[test]
+    fn rejects_tuple_structs() {
+        let input: DeriveInput = parse_quote! {
+            #[derive(Composite)]
+            #[composite(message = ParentMsg)]
+            struct Parent(ChildModel);
+        };
+
+        assert_eq!(
+            parse_error(input).to_string(),
+            "`Composite` supports only structs with named fields"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_child_path() {
+        let input: DeriveInput = parse_quote! {
+            #[derive(Composite)]
+            #[composite(message = ParentMsg)]
+            struct Parent {
+                #[child(lift = ParentMsg::Child, extract = ParentMsg::into_child)]
+                child: ChildModel,
+            }
+        };
+
+        assert_eq!(
+            parse_error(input).to_string(),
+            "missing `path`; expected `path = \"...\"`"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_child_lift() {
+        let input: DeriveInput = parse_quote! {
+            #[derive(Composite)]
+            #[composite(message = ParentMsg)]
+            struct Parent {
+                #[child(path = "child", extract = ParentMsg::into_child)]
+                child: ChildModel,
+            }
+        };
+
+        assert_eq!(
+            parse_error(input).to_string(),
+            "missing `lift`; expected `lift = ...`"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_child_extract() {
+        let input: DeriveInput = parse_quote! {
+            #[derive(Composite)]
+            #[composite(message = ParentMsg)]
+            struct Parent {
+                #[child(path = "child", lift = ParentMsg::Child)]
+                child: ChildModel,
+            }
+        };
+
+        assert_eq!(
+            parse_error(input).to_string(),
+            "missing `extract`; expected `extract = ...`"
         );
     }
 }

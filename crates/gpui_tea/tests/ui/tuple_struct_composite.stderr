@@ -1,0 +1,5 @@
+error: `Composite` supports only structs with named fields
+ --> tests/ui/tuple_struct_composite.rs:7:1
+  |
+7 | struct Parent(usize);
+  | ^^^^^^

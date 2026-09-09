@@ -1,0 +1,5 @@
+error: `#[child]` attribute is not supported on structs; place it on named child fields instead
+  --> tests/ui/child_on_struct.rs:19:1
+   |
+19 | #[child(path = "child", lift = Msg::Child, extract = Msg::into_child)]
+   | ^

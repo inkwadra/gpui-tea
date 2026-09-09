@@ -18,6 +18,21 @@ pub(crate) fn expand_composite(spec: CompositeSpec) -> proc_macro2::TokenStream 
     let update_steps = children.iter().map(update_step);
     let subscription_steps = children.iter().map(subscription_step);
     let view_methods = children.iter().map(|child| view_method(child, &message_ty));
+    let (cx_ident, scope_ident) = if children.is_empty() {
+        (quote!(_cx), quote!(_scope))
+    } else {
+        (quote!(cx), quote!(scope))
+    };
+
+    let subscriptions_body = if children.is_empty() {
+        quote!(::gpui_tea::Subscriptions::none())
+    } else {
+        quote! {
+            let mut __subscriptions = ::gpui_tea::Subscriptions::none();
+            #(#subscription_steps)*
+            __subscriptions
+        }
+    };
 
     quote! {
         #[allow(dead_code)]
@@ -27,8 +42,8 @@ pub(crate) fn expand_composite(spec: CompositeSpec) -> proc_macro2::TokenStream 
             #[doc(hidden)]
             fn __composite_init(
                 &mut self,
-                cx: &mut ::gpui::App,
-                scope: &::gpui_tea::ModelContext<#message_ty>,
+                #cx_ident: &mut ::gpui::App,
+                #scope_ident: &::gpui_tea::ModelContext<#message_ty>,
             ) -> ::gpui_tea::Command<#message_ty> {
                 #init_body
             }
@@ -37,8 +52,8 @@ pub(crate) fn expand_composite(spec: CompositeSpec) -> proc_macro2::TokenStream 
             fn __composite_update(
                 &mut self,
                 msg: #message_ty,
-                cx: &mut ::gpui::App,
-                scope: &::gpui_tea::ModelContext<#message_ty>,
+                #cx_ident: &mut ::gpui::App,
+                #scope_ident: &::gpui_tea::ModelContext<#message_ty>,
             ) -> ::core::result::Result<::gpui_tea::Command<#message_ty>, #message_ty> {
                 #(#update_steps)*
                 ::core::result::Result::Err(msg)
@@ -47,12 +62,10 @@ pub(crate) fn expand_composite(spec: CompositeSpec) -> proc_macro2::TokenStream 
             #[doc(hidden)]
             fn __composite_subscriptions(
                 &self,
-                cx: &mut ::gpui::App,
-                scope: &::gpui_tea::ModelContext<#message_ty>,
+                #cx_ident: &mut ::gpui::App,
+                #scope_ident: &::gpui_tea::ModelContext<#message_ty>,
             ) -> ::gpui_tea::Subscriptions<#message_ty> {
-                let mut __subscriptions = ::gpui_tea::Subscriptions::none();
-                #(#subscription_steps)*
-                __subscriptions
+                #subscriptions_body
             }
 
             #(#view_methods)*
@@ -214,5 +227,19 @@ mod tests {
 
         let tokens = expand_composite(spec).to_token_stream().to_string();
         assert!(tokens.contains("allow (dead_code"));
+    }
+
+    #[test]
+    fn expansion_without_children_uses_prefixed_context_parameters() {
+        let spec = CompositeSpec {
+            struct_ident: parse_quote!(Parent),
+            generics: parse_quote!(),
+            message_ty: parse_quote!(ParentMsg),
+            children: vec![],
+        };
+
+        let tokens = expand_composite(spec).to_token_stream().to_string();
+        assert!(tokens.contains("_cx : & mut :: gpui :: App"));
+        assert!(tokens.contains("_scope : & :: gpui_tea :: ModelContext < ParentMsg >"));
     }
 }
