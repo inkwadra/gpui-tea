@@ -11,10 +11,10 @@ use std::{
     time::SystemTime,
 };
 
-#[cfg(feature = "metrics")]
-pub use adapters::observe_metrics_telemetry;
 #[cfg(feature = "tracing")]
 pub use adapters::observe_tracing_telemetry;
+#[cfg(feature = "metrics")]
+pub use adapters::{MetricsAdapter, MetricsAdapterConfig, observe_metrics_telemetry};
 pub use config::{ProgramConfig, ProgramId};
 pub use events::{RuntimeEvent, TelemetryEnvelope, TelemetryEvent, TelemetryMetadata};
 pub use policy::{QueueOverflowAction, QueuePolicy};

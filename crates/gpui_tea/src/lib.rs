@@ -34,10 +34,10 @@ pub use error::{Error, Result};
 pub use gpui_tea_macros::Composite;
 pub use key::Key;
 pub use model::{Model, ModelExt};
-#[cfg(feature = "metrics")]
-pub use observability::observe_metrics_telemetry;
 #[cfg(feature = "tracing")]
 pub use observability::observe_tracing_telemetry;
+#[cfg(feature = "metrics")]
+pub use observability::{MetricsAdapter, MetricsAdapterConfig, observe_metrics_telemetry};
 pub use observability::{
     ProgramConfig, ProgramId, QueueOverflowAction, QueuePolicy, RuntimeEvent, TelemetryEnvelope,
     TelemetryEvent, TelemetryMetadata,

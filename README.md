@@ -95,7 +95,7 @@ use.
 
 | Feature | Default | Description |
 | --- | --- | --- |
-| `metrics` | No | Enables `observe_metrics_telemetry`. |
+| `metrics` | No | Enables `MetricsAdapter`, `MetricsAdapterConfig`, and `observe_metrics_telemetry`. |
 | `tracing` | No | Enables `observe_tracing_telemetry` and the `telemetry` example. |
 
 ### Runtime Configuration

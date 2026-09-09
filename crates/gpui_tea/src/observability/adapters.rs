@@ -1,7 +1,7 @@
 #[cfg(any(feature = "tracing", feature = "metrics"))]
 use super::{TelemetryEnvelope, TelemetryEvent};
 
-#[cfg(feature = "tracing")]
+#[cfg(any(feature = "tracing", feature = "metrics"))]
 use std::sync::Arc;
 
 #[cfg(feature = "tracing")]
@@ -305,85 +305,232 @@ pub fn observe_tracing_telemetry<Msg>(envelope: TelemetryEnvelope<'_, Msg>) {
 }
 
 #[cfg(feature = "metrics")]
-/// Record a [`TelemetryEnvelope`] as `metrics` counters and gauges.
-#[allow(clippy::cast_precision_loss)]
-pub fn observe_metrics_telemetry<Msg>(envelope: TelemetryEnvelope<'_, Msg>) {
-    use metrics::{counter, gauge};
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Configuration for the [`MetricsAdapter`].
+pub struct MetricsAdapterConfig {
+    pub(crate) include_program_id: bool,
+    pub(crate) program_name: Option<Arc<str>>,
+}
 
-    let TelemetryEnvelope { metadata, event } = envelope;
-    let program_id = metadata.program_id.get().to_string();
-    gauge!("gpui_tea.queue.depth", "program_id" => program_id.clone())
-        .set(metadata.queue_depth as f64);
-
-    match event {
-        TelemetryEvent::DispatchAccepted { .. } => {
-            counter!("gpui_tea.dispatch.accepted", "program_id" => program_id.clone()).increment(1);
-        }
-        TelemetryEvent::DispatchRejected { .. } => {
-            counter!("gpui_tea.dispatch.rejected", "program_id" => program_id.clone()).increment(1);
-        }
-        TelemetryEvent::QueueOverflow { action, .. } => {
-            counter!(
-                "gpui_tea.queue.overflow",
-                "program_id" => program_id.clone(),
-                "action" => action.as_str()
-            )
-            .increment(1);
-        }
-        TelemetryEvent::CommandScheduled { kind, .. } => {
-            counter!(
-                "gpui_tea.command.scheduled",
-                "program_id" => program_id.clone(),
-                "kind" => kind.as_str()
-            )
-            .increment(1);
-        }
-        TelemetryEvent::EffectStarted { kind, .. } => {
-            counter!(
-                "gpui_tea.effect.started",
-                "program_id" => program_id.clone(),
-                "kind" => kind.as_str()
-            )
-            .increment(1);
-        }
-        TelemetryEvent::EffectCompleted { kind, .. } => {
-            counter!(
-                "gpui_tea.effect.completed",
-                "program_id" => program_id.clone(),
-                "kind" => kind.as_str()
-            )
-            .increment(1);
-        }
-        TelemetryEvent::KeyedCommandReplaced { .. } => {
-            counter!("gpui_tea.keyed.replaced", "program_id" => program_id.clone()).increment(1);
-        }
-        TelemetryEvent::KeyedCommandCanceled { .. } => {
-            counter!("gpui_tea.keyed.canceled", "program_id" => program_id.clone()).increment(1);
-        }
-        TelemetryEvent::StaleKeyedCompletionIgnored { .. } => {
-            counter!("gpui_tea.keyed.stale_ignored", "program_id" => program_id.clone())
-                .increment(1);
-        }
-        TelemetryEvent::SubscriptionBuilt { .. } => {
-            counter!("gpui_tea.subscription.built", "program_id" => program_id.clone())
-                .increment(1);
-        }
-        TelemetryEvent::SubscriptionRemoved { .. } => {
-            counter!("gpui_tea.subscription.removed", "program_id" => program_id.clone())
-                .increment(1);
-        }
-        TelemetryEvent::SubscriptionsReconciled { active, .. } => {
-            gauge!("gpui_tea.subscription.active", "program_id" => program_id.clone())
-                .set(active as f64);
-        }
-        TelemetryEvent::QueueWarning { .. } => {
-            counter!("gpui_tea.queue.warning", "program_id" => program_id.clone()).increment(1);
-        }
-        TelemetryEvent::QueueDrainStarted { .. }
-        | TelemetryEvent::MessageProcessed { .. }
-        | TelemetryEvent::SubscriptionRetained { .. }
-        | TelemetryEvent::QueueDrainFinished { .. } => {}
+#[cfg(feature = "metrics")]
+impl MetricsAdapterConfig {
+    /// Create a new metrics adapter configuration with default settings.
+    ///
+    /// By default, `include_program_id` is `false` to avoid high cardinality,
+    /// and `program_name` is `None`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
+
+    /// Enable or disable attaching `"program_id"` labels to emitted metrics.
+    ///
+    /// Defaults to `false`. When enabled, metrics include `"program_id" => id`.
+    /// Note that each mounted program receives a new monotonic identifier,
+    /// which can cause high label cardinality in metric collectors.
+    #[must_use]
+    pub fn include_program_id(mut self, include: bool) -> Self {
+        self.include_program_id = include;
+        self
+    }
+
+    /// Set an explicit program name to use for the `"program"` label.
+    ///
+    /// If not configured, the adapter falls back to `program_description` from
+    /// telemetry metadata. If neither is present, the `"program"` label is omitted.
+    #[must_use]
+    pub fn program_name(mut self, name: impl Into<Arc<str>>) -> Self {
+        self.program_name = Some(name.into());
+        self
+    }
+
+    /// Return whether `"program_id"` labels are enabled.
+    #[must_use]
+    pub fn is_program_id_included(&self) -> bool {
+        self.include_program_id
+    }
+
+    /// Return the configured program name, if any.
+    #[must_use]
+    pub fn program_name_label(&self) -> Option<&str> {
+        self.program_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// Build a [`MetricsAdapter`] with this configuration.
+    #[must_use]
+    pub fn build(self) -> MetricsAdapter {
+        MetricsAdapter::with_config(self)
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl From<MetricsAdapterConfig> for MetricsAdapter {
+    fn from(config: MetricsAdapterConfig) -> Self {
+        Self::with_config(config)
+    }
+}
+
+#[cfg(feature = "metrics")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// An adapter that records [`TelemetryEnvelope`] events as `metrics` counters and gauges.
+///
+/// # Label Cardinality
+///
+/// By default, this adapter uses a stable `"program"` label derived from the configured
+/// `program_name` or the program's `program_description`. If neither is provided, the
+/// `"program"` label is omitted entirely.
+///
+/// Per-instance `"program_id"` labels are disabled by default to prevent unbounded
+/// cardinality in systems where programs are created and destroyed frequently. If per-instance
+/// identification is desired, enable it explicitly via [`MetricsAdapter::include_program_id`].
+pub struct MetricsAdapter {
+    config: MetricsAdapterConfig,
+}
+
+#[cfg(feature = "metrics")]
+impl MetricsAdapter {
+    /// Create a new metrics adapter with default configuration.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a new metrics adapter with the specified configuration.
+    #[must_use]
+    pub fn with_config(config: MetricsAdapterConfig) -> Self {
+        Self { config }
+    }
+
+    /// Set whether to include `"program_id"` labels on emitted metrics.
+    #[must_use]
+    pub fn include_program_id(mut self, include: bool) -> Self {
+        self.config = self.config.include_program_id(include);
+        self
+    }
+
+    /// Set an explicit program name used as the `"program"` label.
+    #[must_use]
+    pub fn program_name(mut self, name: impl Into<Arc<str>>) -> Self {
+        self.config = self.config.program_name(name);
+        self
+    }
+
+    /// Return a reference to the adapter configuration.
+    #[must_use]
+    pub fn config(&self) -> &MetricsAdapterConfig {
+        &self.config
+    }
+
+    /// Return a telemetry observer closure suitable for [`crate::ProgramConfig::telemetry_observer`].
+    pub fn observer<Msg>(
+        &self,
+    ) -> impl Fn(TelemetryEnvelope<'_, Msg>) + Clone + Send + Sync + 'static {
+        let adapter = self.clone();
+        move |envelope| adapter.observe(envelope)
+    }
+
+    /// Record a [`TelemetryEnvelope`] as `metrics` counters and gauges.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn observe<Msg>(&self, envelope: TelemetryEnvelope<'_, Msg>) {
+        use metrics::{Label, counter, gauge};
+
+        let TelemetryEnvelope { metadata, event } = envelope;
+
+        let mut base_labels = Vec::with_capacity(2);
+        let program = self
+            .config
+            .program_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                metadata
+                    .program_description
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+            });
+        if let Some(program) = program {
+            base_labels.push(Label::new("program", program.to_string()));
+        }
+        if self.config.include_program_id {
+            base_labels.push(Label::new(
+                "program_id",
+                metadata.program_id.get().to_string(),
+            ));
+        }
+
+        gauge!("gpui_tea.queue.depth", base_labels.clone()).set(metadata.queue_depth as f64);
+
+        match event {
+            TelemetryEvent::DispatchAccepted { .. } => {
+                counter!("gpui_tea.dispatch.accepted", base_labels).increment(1);
+            }
+            TelemetryEvent::DispatchRejected { .. } => {
+                counter!("gpui_tea.dispatch.rejected", base_labels).increment(1);
+            }
+            TelemetryEvent::QueueOverflow { action, .. } => {
+                let mut labels = base_labels;
+                labels.push(Label::new("action", action.as_str()));
+                counter!("gpui_tea.queue.overflow", labels).increment(1);
+            }
+            TelemetryEvent::CommandScheduled { kind, .. } => {
+                let mut labels = base_labels;
+                labels.push(Label::new("kind", kind.as_str()));
+                counter!("gpui_tea.command.scheduled", labels).increment(1);
+            }
+            TelemetryEvent::EffectStarted { kind, .. } => {
+                let mut labels = base_labels;
+                labels.push(Label::new("kind", kind.as_str()));
+                counter!("gpui_tea.effect.started", labels).increment(1);
+            }
+            TelemetryEvent::EffectCompleted { kind, .. } => {
+                let mut labels = base_labels;
+                labels.push(Label::new("kind", kind.as_str()));
+                counter!("gpui_tea.effect.completed", labels).increment(1);
+            }
+            TelemetryEvent::KeyedCommandReplaced { .. } => {
+                counter!("gpui_tea.keyed.replaced", base_labels).increment(1);
+            }
+            TelemetryEvent::KeyedCommandCanceled { .. } => {
+                counter!("gpui_tea.keyed.canceled", base_labels).increment(1);
+            }
+            TelemetryEvent::StaleKeyedCompletionIgnored { .. } => {
+                counter!("gpui_tea.keyed.stale_ignored", base_labels).increment(1);
+            }
+            TelemetryEvent::SubscriptionBuilt { .. } => {
+                counter!("gpui_tea.subscription.built", base_labels).increment(1);
+            }
+            TelemetryEvent::SubscriptionRemoved { .. } => {
+                counter!("gpui_tea.subscription.removed", base_labels).increment(1);
+            }
+            TelemetryEvent::SubscriptionsReconciled { active, .. } => {
+                gauge!("gpui_tea.subscription.active", base_labels).set(active as f64);
+            }
+            TelemetryEvent::QueueWarning { .. } => {
+                counter!("gpui_tea.queue.warning", base_labels).increment(1);
+            }
+            TelemetryEvent::QueueDrainStarted { .. }
+            | TelemetryEvent::MessageProcessed { .. }
+            | TelemetryEvent::SubscriptionRetained { .. }
+            | TelemetryEvent::QueueDrainFinished { .. } => {}
+        }
+    }
+}
+
+#[cfg(feature = "metrics")]
+/// Record a [`TelemetryEnvelope`] as `metrics` counters and gauges using the default [`MetricsAdapter`].
+///
+/// # Cardinality Note
+///
+/// By default, metrics emitted by this function derive a stable `"program"` label from the program's
+/// `program_description`. If no description is provided, the `"program"` label is omitted entirely.
+/// Monotonic `program_id` labels are not included by default to prevent high cardinality.
+///
+/// For custom configuration (such as enabling `"program_id"` or specifying a static program name),
+/// use [`MetricsAdapter`].
+pub fn observe_metrics_telemetry<Msg>(envelope: TelemetryEnvelope<'_, Msg>) {
+    MetricsAdapter::default().observe(envelope);
 }
 
 #[cfg(feature = "tracing")]
@@ -457,7 +604,10 @@ mod metrics_tests {
     use super::*;
     use crate::{
         CommandKind,
-        observability::{ProgramId, TelemetryEnvelope, TelemetryEvent, TelemetryMetadata},
+        observability::{
+            ProgramId, QueueOverflowAction, QueuePolicy, TelemetryEnvelope, TelemetryEvent,
+            TelemetryMetadata,
+        },
     };
     use metrics::{
         Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata,
@@ -591,7 +741,7 @@ mod metrics_tests {
     }
 
     #[test]
-    fn metrics_adapter_labels_metrics_with_program_id_only() {
+    fn metrics_adapter_default_uses_program_description_and_omits_program_id() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorder = RecordingRecorder { seen: seen.clone() };
 
@@ -599,7 +749,7 @@ mod metrics_tests {
             observe_metrics_telemetry::<()>(TelemetryEnvelope {
                 metadata: TelemetryMetadata {
                     program_id: ProgramId::from_raw(7),
-                    program_description: Some(Arc::from("program:7")),
+                    program_description: Some(Arc::from("counter_app")),
                     event_id: 1,
                     emitted_at: std::time::SystemTime::now(),
                     queue_depth: 3,
@@ -615,7 +765,7 @@ mod metrics_tests {
             observe_metrics_telemetry::<()>(TelemetryEnvelope {
                 metadata: TelemetryMetadata {
                     program_id: ProgramId::from_raw(7),
-                    program_description: Some(Arc::from("program:7")),
+                    program_description: Some(Arc::from("counter_app")),
                     event_id: 2,
                     emitted_at: std::time::SystemTime::now(),
                     queue_depth: 1,
@@ -633,18 +783,196 @@ mod metrics_tests {
         });
 
         let seen = seen.lock().unwrap();
+        // Uses "program" label with value "counter_app"
         assert!(seen.iter().any(|key| {
-            key.name() == "gpui_tea.queue.depth" && has_label(key, "program_id", "7")
+            key.name() == "gpui_tea.queue.depth" && has_label(key, "program", "counter_app")
         }));
         assert!(seen.iter().any(|key| {
-            key.name() == "gpui_tea.subscription.active" && has_label(key, "program_id", "7")
+            key.name() == "gpui_tea.subscription.active" && has_label(key, "program", "counter_app")
         }));
         assert!(seen.iter().any(|key| {
-            key.name() == "gpui_tea.effect.completed" && has_label(key, "program_id", "7")
+            key.name() == "gpui_tea.effect.completed"
+                && has_label(key, "program", "counter_app")
+                && has_label(key, "kind", "background")
         }));
+        // program_id is NOT included by default (cardinality safe)
+        assert!(seen.iter().all(|key| !has_any_label(key, "program_id")));
         assert!(
             seen.iter()
                 .all(|key| !has_any_label(key, "program_description"))
         );
+    }
+
+    #[test]
+    fn metrics_adapter_omits_program_label_when_no_description_or_name() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = RecordingRecorder { seen: seen.clone() };
+
+        metrics::with_local_recorder(&recorder, || {
+            observe_metrics_telemetry::<()>(TelemetryEnvelope {
+                metadata: TelemetryMetadata {
+                    program_id: ProgramId::from_raw(99),
+                    program_description: None,
+                    event_id: 1,
+                    emitted_at: std::time::SystemTime::now(),
+                    queue_depth: 0,
+                },
+                event: TelemetryEvent::DispatchAccepted {
+                    message_description: None,
+                },
+            });
+        });
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2); // queue.depth and dispatch.accepted
+        assert!(seen.iter().all(|key| !has_any_label(key, "program")));
+        assert!(seen.iter().all(|key| !has_any_label(key, "program_id")));
+    }
+
+    #[test]
+    fn metrics_adapter_with_configured_program_name() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = RecordingRecorder { seen: seen.clone() };
+        let adapter = MetricsAdapter::new().program_name("configured_name");
+
+        metrics::with_local_recorder(&recorder, || {
+            adapter.observe::<()>(TelemetryEnvelope {
+                metadata: TelemetryMetadata {
+                    program_id: ProgramId::from_raw(12),
+                    program_description: None,
+                    event_id: 1,
+                    emitted_at: std::time::SystemTime::now(),
+                    queue_depth: 2,
+                },
+                event: TelemetryEvent::DispatchAccepted {
+                    message_description: None,
+                },
+            });
+        });
+
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|key| {
+            key.name() == "gpui_tea.dispatch.accepted"
+                && has_label(key, "program", "configured_name")
+        }));
+        assert!(seen.iter().all(|key| !has_any_label(key, "program_id")));
+    }
+
+    #[test]
+    fn metrics_adapter_attaches_program_id_when_enabled() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = RecordingRecorder { seen: seen.clone() };
+        let adapter = MetricsAdapter::new()
+            .include_program_id(true)
+            .program_name("my_app");
+
+        metrics::with_local_recorder(&recorder, || {
+            adapter.observe::<()>(TelemetryEnvelope {
+                metadata: TelemetryMetadata {
+                    program_id: ProgramId::from_raw(42),
+                    program_description: None,
+                    event_id: 1,
+                    emitted_at: std::time::SystemTime::now(),
+                    queue_depth: 0,
+                },
+                event: TelemetryEvent::QueueOverflow {
+                    policy: QueuePolicy::Unbounded,
+                    action: QueueOverflowAction::RejectedNew,
+                    message_description: None,
+                },
+            });
+        });
+
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|key| {
+            key.name() == "gpui_tea.queue.overflow"
+                && has_label(key, "program", "my_app")
+                && has_label(key, "program_id", "42")
+                && has_label(key, "action", "rejected_new")
+        }));
+    }
+
+    #[test]
+    fn metrics_adapter_config_builder_api() {
+        let config = MetricsAdapterConfig::new()
+            .include_program_id(true)
+            .program_name("test_program");
+
+        assert!(config.is_program_id_included());
+        assert_eq!(config.program_name_label(), Some("test_program"));
+
+        let adapter = config.build();
+        assert!(adapter.config().is_program_id_included());
+        assert_eq!(adapter.config().program_name_label(), Some("test_program"));
+
+        let adapter2 = MetricsAdapter::default().include_program_id(false);
+        assert!(!adapter2.config().is_program_id_included());
+    }
+
+    #[test]
+    fn metrics_adapter_from_config() {
+        let config = MetricsAdapterConfig::new()
+            .include_program_id(true)
+            .program_name("from_config");
+        let adapter = MetricsAdapter::from(config);
+        assert!(adapter.config().is_program_id_included());
+        assert_eq!(adapter.config().program_name_label(), Some("from_config"));
+    }
+
+    #[test]
+    fn metrics_adapter_empty_program_name_handling() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = RecordingRecorder { seen: seen.clone() };
+
+        // Case 1: program_name is empty string, program_description is provided -> falls back to description
+        let adapter = MetricsAdapter::new().program_name("");
+        metrics::with_local_recorder(&recorder, || {
+            adapter.observe::<()>(TelemetryEnvelope {
+                metadata: TelemetryMetadata {
+                    program_id: ProgramId::from_raw(1),
+                    program_description: Some(Arc::from("fallback_desc")),
+                    event_id: 1,
+                    emitted_at: std::time::SystemTime::now(),
+                    queue_depth: 0,
+                },
+                event: TelemetryEvent::DispatchAccepted {
+                    message_description: None,
+                },
+            });
+        });
+
+        {
+            let seen = seen.lock().unwrap();
+            assert!(seen.iter().any(|key| {
+                key.name() == "gpui_tea.dispatch.accepted"
+                    && has_label(key, "program", "fallback_desc")
+            }));
+        }
+
+        // Case 2: program_name is whitespace, program_description is None -> omits "program" label
+        let seen2 = Arc::new(Mutex::new(Vec::new()));
+        let recorder2 = RecordingRecorder {
+            seen: seen2.clone(),
+        };
+        let adapter2 = MetricsAdapter::new().program_name("   ");
+        metrics::with_local_recorder(&recorder2, || {
+            adapter2.observe::<()>(TelemetryEnvelope {
+                metadata: TelemetryMetadata {
+                    program_id: ProgramId::from_raw(2),
+                    program_description: None,
+                    event_id: 2,
+                    emitted_at: std::time::SystemTime::now(),
+                    queue_depth: 0,
+                },
+                event: TelemetryEvent::DispatchAccepted {
+                    message_description: None,
+                },
+            });
+        });
+
+        {
+            let seen2 = seen2.lock().unwrap();
+            assert!(seen2.iter().all(|key| !has_any_label(key, "program")));
+        }
     }
 }
