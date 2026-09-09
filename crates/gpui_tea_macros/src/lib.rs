@@ -17,12 +17,18 @@ use syn::{DeriveInput, parse_macro_input};
 ///
 /// - `#[composite(message = ParentMsg)]` on the struct to declare the parent message type
 /// - `#[child(path = "...", lift = ..., extract = ...)]` on child fields to define:
-///   - the child path segment used for key scoping
+///   - the child path segment used for key scoping (must be a non-empty string literal)
 ///   - a function or constructor that lifts child messages into the parent message type
 ///   - a function that extracts a child message or returns the original parent message
 ///
+/// `lift` and `extract` must coerce to plain `fn` pointers (they cannot capture environment).
+/// `__composite_update` routes messages first-match-wins in field declaration order, so extract
+/// helpers should be mutually exclusive.
+///
 /// Child subscriptions must remain unique after path scoping. The generated
 /// `__composite_subscriptions` helper panics if two child subscriptions collide.
+///
+/// Generated `<field>_view` methods must not collide with inherent methods on the same type.
 #[proc_macro_derive(Composite, attributes(composite, child))]
 pub fn derive_composite(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

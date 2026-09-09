@@ -1,4 +1,4 @@
-error: missing `message`
+error: missing `message`; add `#[composite(message = YourMsg)]`
   --> tests/ui/missing_message.rs:17:10
    |
 17 | #[derive(Composite)]

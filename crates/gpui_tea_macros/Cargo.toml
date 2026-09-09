@@ -12,7 +12,7 @@ publish = ["crates-io"]
 categories.workspace = true
 description = "Procedural macros for gpui_tea."
 keywords = ["gpui", "ui", "tea", "proc-macro"]
-include = ["src/**", "Cargo.toml", "../../LICENSE"]
+include = ["src/**", "Cargo.toml"]
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

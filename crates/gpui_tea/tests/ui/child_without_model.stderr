@@ -1,4 +1,28 @@
 error[E0277]: the trait bound `Child: Model` is not satisfied
+  --> tests/ui/child_without_model.rs:20:5
+   |
+20 |     #[child(path = "child", lift = Msg::Child, extract = Msg::into_child)]
+   |     ^ unsatisfied trait bound
+   |
+help: the trait `Model` is not implemented for `Child`
+  --> tests/ui/child_without_model.rs:15:1
+   |
+15 | struct Child;
+   | ^^^^^^^^^^^^
+
+error[E0277]: the trait bound `Child: Model` is not satisfied
+  --> tests/ui/child_without_model.rs:21:12
+   |
+21 |     child: Child,
+   |            ^^^^^ unsatisfied trait bound
+   |
+help: the trait `Model` is not implemented for `Child`
+  --> tests/ui/child_without_model.rs:15:1
+   |
+15 | struct Child;
+   | ^^^^^^^^^^^^
+
+error[E0277]: the trait bound `Child: Model` is not satisfied
   --> tests/ui/child_without_model.rs:17:10
    |
 17 | #[derive(Composite)]

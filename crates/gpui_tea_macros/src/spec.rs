@@ -1,3 +1,4 @@
+use proc_macro2::Span;
 use quote::format_ident;
 use syn::{Expr, Generics, Ident, LitStr, Type};
 
@@ -11,6 +12,7 @@ pub(crate) struct CompositeSpec {
 pub(crate) struct ChildSpec {
     pub(crate) field_ident: Ident,
     pub(crate) field_ty: Type,
+    pub(crate) field_span: Span,
     pub(crate) path: LitStr,
     pub(crate) lift: Expr,
     pub(crate) extract: Expr,
@@ -49,6 +51,7 @@ mod tests {
         ChildSpec {
             field_ident,
             field_ty: parse_quote!(ChildModel),
+            field_span: Span::call_site(),
             path: parse_quote!("child"),
             lift: parse_quote!(ParentMsg::Child),
             extract: parse_quote!(ParentMsg::into_child),

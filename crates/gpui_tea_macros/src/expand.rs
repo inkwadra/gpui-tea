@@ -1,5 +1,5 @@
 use crate::spec::{ChildSpec, CompositeSpec};
-use quote::quote;
+use quote::{quote, quote_spanned};
 use syn::Type;
 
 pub(crate) fn expand_composite(spec: CompositeSpec) -> proc_macro2::TokenStream {
@@ -20,6 +20,7 @@ pub(crate) fn expand_composite(spec: CompositeSpec) -> proc_macro2::TokenStream 
     let view_methods = children.iter().map(|child| view_method(child, &message_ty));
 
     quote! {
+        #[allow(dead_code)]
         impl #impl_generics #struct_ident #ty_generics #where_clause {
             #(#binding_methods)*
 
@@ -39,7 +40,6 @@ pub(crate) fn expand_composite(spec: CompositeSpec) -> proc_macro2::TokenStream 
                 cx: &mut ::gpui::App,
                 scope: &::gpui_tea::ModelContext<#message_ty>,
             ) -> ::core::result::Result<::gpui_tea::Command<#message_ty>, #message_ty> {
-                let msg = msg;
                 #(#update_steps)*
                 ::core::result::Result::Err(msg)
             }
@@ -71,7 +71,9 @@ fn init_body(children: &[ChildSpec]) -> proc_macro2::TokenStream {
 
 fn child_msg_ty(child: &ChildSpec) -> proc_macro2::TokenStream {
     let field_ty = &child.field_ty;
-    quote!(<#field_ty as ::gpui_tea::Model>::Msg)
+    quote_spanned! {child.field_span=>
+        <#field_ty as ::gpui_tea::Model>::Msg
+    }
 }
 
 fn child_bindings_method(child: &ChildSpec, message_ty: &Type) -> proc_macro2::TokenStream {
@@ -79,14 +81,20 @@ fn child_bindings_method(child: &ChildSpec, message_ty: &Type) -> proc_macro2::T
     let child_msg_ty = child_msg_ty(child);
     let lift = &child.lift;
     let extract = &child.extract;
+    let field_span = child.field_span;
 
-    quote! {
+    // Explicit locals make type mismatches point at lift/extract instead of a bare tuple.
+    quote_spanned! {field_span=>
         #[doc(hidden)]
+        #[allow(clippy::type_complexity)]
         fn #bindings_method_ident() -> (
             fn(#child_msg_ty) -> #message_ty,
             fn(#message_ty) -> ::core::result::Result<#child_msg_ty, #message_ty>,
         ) {
-            (#lift, #extract)
+            let __lift: fn(#child_msg_ty) -> #message_ty = #lift;
+            let __extract: fn(#message_ty) -> ::core::result::Result<#child_msg_ty, #message_ty> =
+                #extract;
+            (__lift, __extract)
         }
     }
 }
@@ -108,11 +116,13 @@ fn update_step(child: &ChildSpec) -> proc_macro2::TokenStream {
     let field_ident = &child.field_ident;
     let path = &child.path;
 
+    // Extract first so a non-matching child does not pay for ChildPath allocation.
+    // Routing is first-match-wins in field declaration order; extract helpers should be exclusive.
     quote! {
         let (__lift, __extract) = Self::#bindings_method_ident();
-        let __child_scope = scope.scope(#path, __lift);
         let msg = match __extract(msg) {
             ::core::result::Result::Ok(child_msg) => {
+                let __child_scope = scope.scope(#path, __lift);
                 return ::core::result::Result::Ok(
                     __child_scope.update(&mut self.#field_ident, child_msg, cx),
                 );
@@ -164,6 +174,7 @@ fn view_method(child: &ChildSpec, message_ty: &Type) -> proc_macro2::TokenStream
 mod tests {
     use super::expand_composite;
     use crate::spec::{ChildSpec, CompositeSpec};
+    use proc_macro2::Span;
     use quote::ToTokens;
     use syn::parse_quote;
 
@@ -176,6 +187,7 @@ mod tests {
             children: vec![ChildSpec {
                 field_ident: parse_quote!(left),
                 field_ty: parse_quote!(LeftChild<T>),
+                field_span: Span::call_site(),
                 path: parse_quote!("left"),
                 lift: parse_quote!(ParentMsg::Left),
                 extract: parse_quote!(ParentMsg::into_left),
@@ -189,5 +201,18 @@ mod tests {
         assert!(
             tokens.contains("let (__lift , __extract) = Self :: __left_composite_bindings () ;")
         );
+    }
+
+    #[test]
+    fn expansion_allows_dead_code_on_generated_helpers() {
+        let spec = CompositeSpec {
+            struct_ident: parse_quote!(Parent),
+            generics: parse_quote!(),
+            message_ty: parse_quote!(ParentMsg),
+            children: vec![],
+        };
+
+        let tokens = expand_composite(spec).to_token_stream().to_string();
+        assert!(tokens.contains("allow (dead_code"));
     }
 }

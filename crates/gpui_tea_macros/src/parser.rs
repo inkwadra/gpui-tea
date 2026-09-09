@@ -31,7 +31,7 @@ pub(crate) fn parse_composite(input: DeriveInput) -> Result<CompositeSpec> {
     })
 }
 
-fn named_fields(data: Data, struct_ident: &Ident) -> Result<FieldsNamed> {
+fn named_fields(data: Data, _struct_ident: &Ident) -> Result<FieldsNamed> {
     match data {
         Data::Struct(data) => match data.fields {
             Fields::Named(fields) => Ok(fields),
@@ -40,9 +40,13 @@ fn named_fields(data: Data, struct_ident: &Ident) -> Result<FieldsNamed> {
                 "`Composite` supports only structs with named fields",
             )),
         },
-        _ => Err(Error::new(
-            struct_ident.span(),
-            "`Composite` supports only structs with named fields",
+        Data::Enum(data) => Err(Error::new(
+            data.enum_token.span(),
+            "`Composite` does not support enums",
+        )),
+        Data::Union(data) => Err(Error::new(
+            data.union_token.span(),
+            "`Composite` does not support unions; use a struct with named fields",
         )),
     }
 }
@@ -56,7 +60,12 @@ fn composite_derive_span(attrs: &[Attribute]) -> Span {
         let mut derive_span = None;
         if attr
             .parse_nested_meta(|meta| {
-                if meta.path.is_ident("Composite") {
+                if meta
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "Composite")
+                {
                     derive_span = Some(meta.path.span());
                 }
                 Ok(())
@@ -92,14 +101,20 @@ fn parse_message_type(attrs: &[Attribute], missing_message_span: Span) -> Result
     if message_ty.is_none() {
         combine_error(
             &mut errors,
-            Error::new(missing_message_span, "missing `message`"),
+            Error::new(
+                missing_message_span,
+                "missing `message`; add `#[composite(message = YourMsg)]`",
+            ),
         );
     }
 
     match (message_ty, errors) {
         (_, Some(error)) => Err(error),
         (Some(message_ty), None) => Ok(message_ty),
-        (None, None) => Err(Error::new(missing_message_span, "missing `message`")),
+        (None, None) => Err(Error::new(
+            missing_message_span,
+            "missing `message`; add `#[composite(message = YourMsg)]`",
+        )),
     }
 }
 
@@ -226,25 +241,38 @@ fn parse_child(field: Field) -> Result<Option<ChildSpec>> {
     }
 
     if !saw_path {
-        combine_error(&mut errors, Error::new(field_span, "missing `path`"));
+        combine_error(
+            &mut errors,
+            Error::new(field_span, "missing `path`; expected `path = \"...\"`"),
+        );
     }
     if lift.is_none() {
-        combine_error(&mut errors, Error::new(field_span, "missing `lift`"));
+        combine_error(
+            &mut errors,
+            Error::new(field_span, "missing `lift`; expected `lift = ...`"),
+        );
     }
     if extract.is_none() {
-        combine_error(&mut errors, Error::new(field_span, "missing `extract`"));
+        combine_error(
+            &mut errors,
+            Error::new(field_span, "missing `extract`; expected `extract = ...`"),
+        );
     }
 
     match (path, lift, extract, errors) {
         (_, _, _, Some(error)) => Err(error),
         (Some(path), Some(lift), Some(extract), None) => Ok(Some(ChildSpec {
+            field_span,
             field_ident,
             field_ty: field.ty,
             path,
             lift,
             extract,
         })),
-        _ => unreachable!("missing child fields must produce an aggregated error"),
+        _ => Err(Error::new(
+            field_span,
+            "incomplete `#[child(...)]` attribute; expected `path`, `lift`, and `extract`",
+        )),
     }
 }
 
@@ -312,15 +340,24 @@ fn parse_child_meta(
         }
         Meta::NameValue(name_value) => combine_error(
             errors,
-            Error::new(name_value.path.span(), "unsupported `child` attribute"),
+            Error::new(
+                name_value.path.span(),
+                "unsupported `child` attribute; expected `path = \"...\"`, `lift = ...`, or `extract = ...`",
+            ),
         ),
         Meta::Path(path) => combine_error(
             errors,
-            Error::new(path.span(), "unsupported `child` attribute"),
+            Error::new(
+                path.span(),
+                "unsupported `child` attribute; expected `path = \"...\"`, `lift = ...`, or `extract = ...`",
+            ),
         ),
         Meta::List(meta_list) => combine_error(
             errors,
-            Error::new(meta_list.path.span(), "unsupported `child` attribute"),
+            Error::new(
+                meta_list.path.span(),
+                "unsupported `child` attribute; expected `path = \"...\"`, `lift = ...`, or `extract = ...`",
+            ),
         ),
     }
 }
@@ -333,6 +370,13 @@ fn set_child_path(slot: &mut Option<LitStr>, span: Span, value: Expr, errors: &m
 
     match value {
         Expr::Lit(expr_lit) => match expr_lit.lit {
+            Lit::Str(path) if path.value().is_empty() => combine_error(
+                errors,
+                Error::new(
+                    path.span(),
+                    "`path` must be a non-empty string literal (e.g. `path = \"sidebar\"`)",
+                ),
+            ),
             Lit::Str(path) => *slot = Some(path),
             _ => combine_error(
                 errors,
@@ -395,6 +439,7 @@ mod tests {
         ChildSpec {
             field_ident,
             field_ty: parse_quote!(ChildModel),
+            field_span: Span::call_site(),
             path: parse_quote!("child"),
             lift: parse_quote!(ParentMsg::Child),
             extract: parse_quote!(ParentMsg::into_child),
@@ -442,7 +487,10 @@ mod tests {
             }
         };
 
-        assert_eq!(parse_error(input).to_string(), "missing `message`");
+        assert_eq!(
+            parse_error(input).to_string(),
+            "missing `message`; add `#[composite(message = YourMsg)]`"
+        );
     }
 
     #[test]
@@ -460,6 +508,24 @@ mod tests {
         let errors = compile_error_string(&error);
         assert!(errors.contains("duplicate `path` attribute"));
         assert!(errors.contains("unsupported `child` attribute"));
+    }
+
+    #[test]
+    fn rejects_empty_child_path() {
+        let input: DeriveInput = parse_quote! {
+            #[derive(Composite)]
+            #[composite(message = ParentMsg)]
+            struct Parent {
+                #[child(path = "", lift = ParentMsg::Child, extract = ParentMsg::into_child)]
+                child: ChildModel,
+            }
+        };
+
+        let error = parse_error(input);
+        assert!(
+            compile_error_string(&error).contains("non-empty string literal"),
+            "expected empty-path rejection, got: {error}"
+        );
     }
 
     #[test]
