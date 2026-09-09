@@ -15,7 +15,11 @@ pub(crate) type BackgroundEffectFn<Msg> =
     Box<dyn FnOnce(BackgroundExecutor) -> BoxFuture<'static, Option<Msg>> + 'static>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 /// Classify how a [`Command`] interacts with the runtime.
+///
+/// Marked non-exhaustive so future command kinds (for example window-bound effects) can be added
+/// without a breaking change.
 pub enum CommandKind {
     /// Emit a message synchronously back into the program queue.
     Emit,
@@ -23,6 +27,18 @@ pub enum CommandKind {
     Foreground,
     /// Run an effect on the background executor.
     Background,
+}
+
+impl CommandKind {
+    /// Return a stable lowercase label suitable for metrics tags.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Emit => "emit",
+            Self::Foreground => "foreground",
+            Self::Background => "background",
+        }
+    }
 }
 
 /// The internal representation of an effect.
@@ -339,7 +355,10 @@ impl<Msg: Send + 'static> Command<Msg> {
     /// Combine multiple commands into a single command.
     ///
     /// Nested batches are flattened and [`Command::none()`] entries are discarded so the runtime
-    /// does not spend work traversing empty structure.
+    /// does not spend work traversing empty structure. A label attached to an outer batch is not
+    /// propagated to child commands; label each child individually when you need per-command
+    /// observability. When the batch collapses to a single command, that command (and its label)
+    /// is returned unchanged.
     ///
     /// # Arguments
     ///

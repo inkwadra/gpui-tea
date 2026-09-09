@@ -6,6 +6,10 @@ use std::sync::Arc;
 
 #[cfg(feature = "tracing")]
 /// Record a [`TelemetryEnvelope`] as `tracing` events.
+///
+/// Events share the `gpui_tea::observability::adapters` target; filter by the `event_name` field
+/// (for example `dispatch.accepted`).
+#[allow(clippy::too_many_lines)]
 pub fn observe_tracing_telemetry<Msg>(envelope: TelemetryEnvelope<'_, Msg>) {
     use tracing::{Level, event};
 
@@ -302,6 +306,7 @@ pub fn observe_tracing_telemetry<Msg>(envelope: TelemetryEnvelope<'_, Msg>) {
 
 #[cfg(feature = "metrics")]
 /// Record a [`TelemetryEnvelope`] as `metrics` counters and gauges.
+#[allow(clippy::cast_precision_loss)]
 pub fn observe_metrics_telemetry<Msg>(envelope: TelemetryEnvelope<'_, Msg>) {
     use metrics::{counter, gauge};
 
@@ -321,7 +326,7 @@ pub fn observe_metrics_telemetry<Msg>(envelope: TelemetryEnvelope<'_, Msg>) {
             counter!(
                 "gpui_tea.queue.overflow",
                 "program_id" => program_id.clone(),
-                "action" => format!("{action:?}")
+                "action" => action.as_str()
             )
             .increment(1);
         }
@@ -329,7 +334,7 @@ pub fn observe_metrics_telemetry<Msg>(envelope: TelemetryEnvelope<'_, Msg>) {
             counter!(
                 "gpui_tea.command.scheduled",
                 "program_id" => program_id.clone(),
-                "kind" => format!("{kind:?}")
+                "kind" => kind.as_str()
             )
             .increment(1);
         }
@@ -337,7 +342,7 @@ pub fn observe_metrics_telemetry<Msg>(envelope: TelemetryEnvelope<'_, Msg>) {
             counter!(
                 "gpui_tea.effect.started",
                 "program_id" => program_id.clone(),
-                "kind" => format!("{kind:?}")
+                "kind" => kind.as_str()
             )
             .increment(1);
         }
@@ -345,7 +350,7 @@ pub fn observe_metrics_telemetry<Msg>(envelope: TelemetryEnvelope<'_, Msg>) {
             counter!(
                 "gpui_tea.effect.completed",
                 "program_id" => program_id.clone(),
-                "kind" => format!("{kind:?}")
+                "kind" => kind.as_str()
             )
             .increment(1);
         }
@@ -371,8 +376,10 @@ pub fn observe_metrics_telemetry<Msg>(envelope: TelemetryEnvelope<'_, Msg>) {
             gauge!("gpui_tea.subscription.active", "program_id" => program_id.clone())
                 .set(active as f64);
         }
+        TelemetryEvent::QueueWarning { .. } => {
+            counter!("gpui_tea.queue.warning", "program_id" => program_id.clone()).increment(1);
+        }
         TelemetryEvent::QueueDrainStarted { .. }
-        | TelemetryEvent::QueueWarning { .. }
         | TelemetryEvent::MessageProcessed { .. }
         | TelemetryEvent::SubscriptionRetained { .. }
         | TelemetryEvent::QueueDrainFinished { .. } => {}

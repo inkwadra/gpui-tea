@@ -42,3 +42,15 @@ pub enum QueueOverflowAction {
     /// Drop the oldest queued message.
     DroppedOldest,
 }
+
+impl QueueOverflowAction {
+    /// Return a stable lowercase label suitable for metrics tags.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RejectedNew => "rejected_new",
+            Self::DroppedNewest => "dropped_newest",
+            Self::DroppedOldest => "dropped_oldest",
+        }
+    }
+}
