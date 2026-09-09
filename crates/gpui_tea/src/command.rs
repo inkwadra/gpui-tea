@@ -27,6 +27,8 @@ pub enum CommandKind {
     Foreground,
     /// Run an effect on the background executor.
     Background,
+    /// Cancel a running keyed command.
+    Cancel,
 }
 
 impl CommandKind {
@@ -37,6 +39,7 @@ impl CommandKind {
             Self::Emit => "emit",
             Self::Foreground => "foreground",
             Self::Background => "background",
+            Self::Cancel => "cancel",
         }
     }
 }
@@ -86,6 +89,20 @@ pub(crate) enum CommandInner<Msg> {
 /// Commands are pure values. A model returns them from [`crate::Model::init()`] and
 /// [`crate::Model::update()`], and [`crate::Program`] executes them after the current transition
 /// completes.
+///
+/// # Guaranteed Delivery for Internal Messages
+///
+/// Internal messages produced by commands ([`Command::emit`]) and asynchronous effects
+/// ([`Command::foreground`], [`Command::background`], [`Command::foreground_keyed`],
+/// [`Command::background_keyed`]) have guaranteed delivery into the program's pending queue.
+/// They are never rejected, dropped, or displaced by external dispatches.
+///
+/// The capacity limits and drop actions of [`crate::QueuePolicy`] ([`crate::QueuePolicy::RejectNew`],
+/// [`crate::QueuePolicy::DropOldest`], [`crate::QueuePolicy::DropNewest`]) apply strictly to external
+/// dispatches via [`crate::Dispatcher`]. External dispatches under [`crate::QueuePolicy::DropOldest`]
+/// may only displace other external messages in the active pool; internal messages in the pending
+/// queue remain fully protected. Strict FIFO processing order between internal and external messages
+/// is preserved as the queue is drained.
 pub struct Command<Msg> {
     pub(crate) inner: CommandInner<Msg>,
     pub(crate) label: Option<Arc<str>>,
@@ -129,6 +146,10 @@ impl<Msg: Send + 'static> Command<Msg> {
 
     /// Return a command that enqueues `message` immediately.
     ///
+    /// Internally emitted messages have guaranteed delivery into the program's pending queue.
+    /// They are never rejected, dropped, or displaced by external dispatches, regardless of the
+    /// configured [`crate::QueuePolicy`].
+    ///
     /// # Arguments
     ///
     /// * `message` - The message to enqueue.
@@ -151,7 +172,9 @@ impl<Msg: Send + 'static> Command<Msg> {
     /// Return a command that runs an effect on the GPUI foreground executor.
     ///
     /// The effect receives an [`AsyncApp`] tied to the mounted program and may emit a follow-up
-    /// message by returning `Some`.
+    /// message by returning `Some`. Follow-up messages have guaranteed delivery into the program's
+    /// pending queue and are never rejected, dropped, or displaced by external dispatches under any
+    /// [`crate::QueuePolicy`].
     ///
     /// # Arguments
     ///
@@ -185,6 +208,11 @@ impl<Msg: Send + 'static> Command<Msg> {
     /// When a newer keyed command with the same [`Key`] is scheduled, the runtime ignores the
     /// completion of the older one.
     ///
+    /// The effect receives an [`AsyncApp`] tied to the mounted program and may emit a follow-up
+    /// message by returning `Some`. Follow-up messages have guaranteed delivery into the program's
+    /// pending queue and are never rejected, dropped, or displaced by external dispatches under any
+    /// [`crate::QueuePolicy`].
+    ///
     /// # Arguments
     ///
     /// * `key` - The key to associate with this effect.
@@ -206,7 +234,9 @@ impl<Msg: Send + 'static> Command<Msg> {
     /// Return a command that runs an effect on the background executor.
     ///
     /// The closure receives the executor so nested background work can be spawned without
-    /// capturing external runtime state.
+    /// capturing external runtime state. If the returned future produces `Some(msg)`, that message
+    /// has guaranteed delivery into the program's pending queue and is never rejected, dropped,
+    /// or displaced by external dispatches under any [`crate::QueuePolicy`].
     ///
     /// # Arguments
     ///
@@ -239,7 +269,9 @@ impl<Msg: Send + 'static> Command<Msg> {
     /// Return a keyed background effect that replaces any in-flight effect with the same key.
     ///
     /// When a newer keyed command with the same [`Key`] is scheduled, the runtime ignores the
-    /// completion of the older one.
+    /// completion of the older one. If the returned future produces `Some(msg)`, that message
+    /// has guaranteed delivery into the program's pending queue and is never rejected, dropped,
+    /// or displaced by external dispatches under any [`crate::QueuePolicy`].
     ///
     /// # Arguments
     ///

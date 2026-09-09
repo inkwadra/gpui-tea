@@ -3,8 +3,8 @@ use futures::channel::oneshot;
 use gpui::{App, Entity, TestAppContext, Window, div};
 use gpui_tea::{
     ChildPath, Command, CommandKind, Composite, Dispatcher, IntoView, Model, ModelContext,
-    ModelExt, Program, ProgramConfig, RuntimeEvent, SubHandle, Subscription, Subscriptions,
-    TelemetryEnvelope, View,
+    ModelExt, Program, ProgramConfig, QueueOverflowAction, QueuePolicy, RuntimeEvent, SubHandle,
+    Subscription, Subscriptions, TelemetryEnvelope, TelemetryEvent, View,
 };
 use std::{
     collections::VecDeque,
@@ -2581,4 +2581,1543 @@ fn telemetry_metadata_uses_stable_program_id_and_monotonic_event_ids(cx: &mut Te
         );
     }
     assert!(records.iter().any(|record| record.queue_depth == 0));
+}
+
+#[gpui::test]
+fn drop_oldest_via_mounted_program_records_displaced_message_description(cx: &mut TestAppContext) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Set(i32),
+    }
+
+    struct QueueModel {
+        received: Vec<i32>,
+    }
+
+    impl Model for QueueModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Set(val) => self.received.push(val),
+            }
+            Command::none()
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let telemetry_events = Arc::new(Mutex::new(Vec::new()));
+
+    let config = ProgramConfig::default()
+        .queue_policy(QueuePolicy::DropOldest { capacity: 2 })
+        .describe_message(|msg: &Msg| match msg {
+            Msg::Set(v) => format!("set:{v}"),
+        })
+        .telemetry_observer({
+            let telemetry_events = telemetry_events.clone();
+            move |envelope| {
+                if let TelemetryEvent::QueueOverflow {
+                    action,
+                    message_description,
+                    ..
+                } = &envelope.event
+                {
+                    telemetry_events
+                        .lock()
+                        .unwrap()
+                        .push((*action, message_description.clone()));
+                }
+            }
+        });
+
+    let program: Entity<Program<QueueModel>> = cx.update(|cx| {
+        QueueModel {
+            received: Vec::new(),
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    dispatcher.dispatch(Msg::Set(1)).unwrap();
+    dispatcher.dispatch(Msg::Set(2)).unwrap();
+    dispatcher.dispatch(Msg::Set(3)).unwrap();
+
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().received.as_slice(), &[2, 3]);
+    });
+
+    let overflows = telemetry_events.lock().unwrap();
+    assert_eq!(overflows.len(), 1);
+    assert_eq!(overflows[0].0, QueueOverflowAction::DroppedOldest);
+    assert_eq!(overflows[0].1.as_deref(), Some("set:1"));
+}
+
+#[gpui::test]
+fn drop_newest_via_mounted_program_records_dropped_message_description(cx: &mut TestAppContext) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Set(i32),
+    }
+
+    struct QueueModel {
+        received: Vec<i32>,
+    }
+
+    impl Model for QueueModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Set(val) => self.received.push(val),
+            }
+            Command::none()
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let telemetry_events = Arc::new(Mutex::new(Vec::new()));
+
+    let config = ProgramConfig::default()
+        .queue_policy(QueuePolicy::DropNewest { capacity: 2 })
+        .describe_message(|msg: &Msg| match msg {
+            Msg::Set(v) => format!("set:{v}"),
+        })
+        .telemetry_observer({
+            let telemetry_events = telemetry_events.clone();
+            move |envelope| {
+                if let TelemetryEvent::QueueOverflow {
+                    action,
+                    message_description,
+                    ..
+                } = &envelope.event
+                {
+                    telemetry_events
+                        .lock()
+                        .unwrap()
+                        .push((*action, message_description.clone()));
+                }
+            }
+        });
+
+    let program: Entity<Program<QueueModel>> = cx.update(|cx| {
+        QueueModel {
+            received: Vec::new(),
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    dispatcher.dispatch(Msg::Set(1)).unwrap();
+    dispatcher.dispatch(Msg::Set(2)).unwrap();
+    dispatcher.dispatch(Msg::Set(3)).unwrap();
+
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().received.as_slice(), &[1, 2]);
+    });
+
+    let overflows = telemetry_events.lock().unwrap();
+    assert_eq!(overflows.len(), 1);
+    assert_eq!(overflows[0].0, QueueOverflowAction::DroppedNewest);
+    assert_eq!(overflows[0].1.as_deref(), Some("set:3"));
+}
+
+#[gpui::test]
+fn cancel_key_command_emits_command_scheduled_event_with_label_and_key(cx: &mut TestAppContext) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        CancelTask,
+    }
+
+    struct CancelModel;
+
+    impl Model for CancelModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::CancelTask => Command::cancel_key("task-key").label("stop-task"),
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let scheduled_events = Arc::new(Mutex::new(Vec::new()));
+
+    let config = ProgramConfig::default()
+        .describe_key(|key| format!("{key:?}"))
+        .telemetry_observer({
+            let scheduled_events = scheduled_events.clone();
+            move |envelope| {
+                if let TelemetryEvent::CommandScheduled {
+                    kind,
+                    label,
+                    key,
+                    key_description,
+                } = &envelope.event
+                {
+                    scheduled_events.lock().unwrap().push((
+                        *kind,
+                        label.map(ToString::to_string),
+                        key.map(|k| k.id().to_string()),
+                        key_description.as_deref().map(ToString::to_string),
+                    ));
+                }
+            }
+        });
+
+    let program: Entity<Program<CancelModel>> =
+        cx.update(|cx| CancelModel.into_program_with(config, cx));
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    dispatcher.dispatch(Msg::CancelTask).unwrap();
+    cx.run_until_parked();
+
+    let scheduled = scheduled_events.lock().unwrap();
+    assert!(scheduled.iter().any(|(kind, label, key, key_desc)| {
+        *kind == CommandKind::Cancel
+            && label.as_deref() == Some("stop-task")
+            && key.as_deref() == Some("task-key")
+            && key_desc.as_deref() == Some("Key(\"task-key\")")
+    }));
+}
+
+#[gpui::test]
+fn keyed_effects_are_canceled_when_program_is_dropped(cx: &mut TestAppContext) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Run,
+        Loaded(i32),
+    }
+
+    struct KeyedDropModel {
+        receiver: Option<oneshot::Receiver<i32>>,
+        loaded: Vec<i32>,
+    }
+
+    impl Model for KeyedDropModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Run => {
+                    let receiver = self
+                        .receiver
+                        .take()
+                        .expect("run should only be dispatched once");
+                    Command::background_keyed("load_key", move |_| async move {
+                        receiver.await.ok().map(Msg::Loaded)
+                    })
+                }
+                Msg::Loaded(val) => {
+                    self.loaded.push(val);
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let (sender, receiver) = oneshot::channel();
+    type KeyedProgram = Entity<Program<KeyedDropModel>>;
+
+    let program_slot: Arc<Mutex<Option<KeyedProgram>>> = Arc::new(Mutex::new(None));
+    let window = cx.update(|cx| {
+        let program_slot = program_slot.clone();
+        cx.open_window(gpui::WindowOptions::default(), move |_, cx| {
+            let program = Program::mount(
+                KeyedDropModel {
+                    receiver: Some(receiver),
+                    loaded: Vec::new(),
+                },
+                cx,
+            );
+            *program_slot.lock().unwrap() = Some(program.clone());
+            program
+        })
+        .unwrap()
+    });
+
+    let program = program_slot.lock().unwrap().take().unwrap();
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+    drop(program);
+
+    cx.executor().allow_parking();
+    dispatcher.dispatch(Msg::Run).unwrap();
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+    });
+    cx.run_until_parked();
+    cx.executor().forbid_parking();
+
+    assert_eq!(sender.send(99), Err(99));
+}
+
+#[gpui::test]
+fn subscriptions_are_canceled_when_program_is_dropped(cx: &mut TestAppContext) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {}
+
+    struct SubDropModel {
+        receiver: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    }
+
+    impl Model for SubDropModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            _msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            Command::none()
+        }
+
+        fn subscriptions(
+            &self,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Subscriptions<Self::Msg> {
+            let receiver = self.receiver.lock().unwrap().take();
+            Subscriptions::one(Subscription::new("active_sub", move |sub_cx| {
+                if let Some(receiver) = receiver {
+                    let task = sub_cx.app().background_executor().spawn(async move {
+                        let _ = receiver.await;
+                    });
+                    SubHandle::Task(task)
+                } else {
+                    SubHandle::None
+                }
+            }))
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let (sender, receiver) = oneshot::channel();
+    type SubProgram = Entity<Program<SubDropModel>>;
+
+    let program_slot: Arc<Mutex<Option<SubProgram>>> = Arc::new(Mutex::new(None));
+    let window = cx.update(|cx| {
+        let program_slot = program_slot.clone();
+        cx.open_window(gpui::WindowOptions::default(), move |_, cx| {
+            let program = Program::mount(
+                SubDropModel {
+                    receiver: Arc::new(Mutex::new(Some(receiver))),
+                },
+                cx,
+            );
+            *program_slot.lock().unwrap() = Some(program.clone());
+            program
+        })
+        .unwrap()
+    });
+
+    let program = program_slot.lock().unwrap().take().unwrap();
+    drop(program);
+
+    cx.executor().allow_parking();
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+    });
+    cx.run_until_parked();
+    cx.executor().forbid_parking();
+
+    assert_eq!(sender.send(()), Err(()));
+}
+
+#[gpui::test]
+fn drop_oldest_via_internal_emits_preserves_all_messages(cx: &mut TestAppContext) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Trigger,
+        Step(i32),
+    }
+
+    struct InternalModel {
+        processed: Vec<i32>,
+    }
+
+    impl Model for InternalModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Trigger => Command::batch([
+                    Command::emit(Msg::Step(1)),
+                    Command::emit(Msg::Step(2)),
+                    Command::emit(Msg::Step(3)),
+                ]),
+                Msg::Step(val) => {
+                    self.processed.push(val);
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let overflow_events = Arc::new(Mutex::new(Vec::new()));
+
+    let config = ProgramConfig::default()
+        .queue_policy(QueuePolicy::DropOldest { capacity: 2 })
+        .describe_message(|msg: &Msg| match msg {
+            Msg::Trigger => String::from("trigger"),
+            Msg::Step(v) => format!("step:{v}"),
+        })
+        .telemetry_observer({
+            let overflow_events = overflow_events.clone();
+            move |envelope| {
+                if let TelemetryEvent::QueueOverflow {
+                    action,
+                    message_description,
+                    ..
+                } = &envelope.event
+                {
+                    overflow_events
+                        .lock()
+                        .unwrap()
+                        .push((*action, message_description.clone()));
+                }
+            }
+        });
+
+    let program: Entity<Program<InternalModel>> = cx.update(|cx| {
+        InternalModel {
+            processed: Vec::new(),
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    dispatcher.dispatch(Msg::Trigger).unwrap();
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        // Internal emits have guaranteed delivery and are never dropped
+        assert_eq!(program.model().processed.as_slice(), &[1, 2, 3]);
+    });
+
+    let overflows = overflow_events.lock().unwrap();
+    assert!(
+        overflows.is_empty(),
+        "internal commands must never produce overflow events"
+    );
+}
+
+#[gpui::test]
+fn drop_newest_via_internal_emits_preserves_all_messages(cx: &mut TestAppContext) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Trigger,
+        Step(i32),
+    }
+
+    struct InternalModel {
+        processed: Vec<i32>,
+    }
+
+    impl Model for InternalModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Trigger => Command::batch([
+                    Command::emit(Msg::Step(1)),
+                    Command::emit(Msg::Step(2)),
+                    Command::emit(Msg::Step(3)),
+                ]),
+                Msg::Step(val) => {
+                    self.processed.push(val);
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let overflow_events = Arc::new(Mutex::new(Vec::new()));
+
+    let config = ProgramConfig::default()
+        .queue_policy(QueuePolicy::DropNewest { capacity: 2 })
+        .describe_message(|msg: &Msg| match msg {
+            Msg::Trigger => String::from("trigger"),
+            Msg::Step(v) => format!("step:{v}"),
+        })
+        .telemetry_observer({
+            let overflow_events = overflow_events.clone();
+            move |envelope| {
+                if let TelemetryEvent::QueueOverflow {
+                    action,
+                    message_description,
+                    ..
+                } = &envelope.event
+                {
+                    overflow_events
+                        .lock()
+                        .unwrap()
+                        .push((*action, message_description.clone()));
+                }
+            }
+        });
+
+    let program: Entity<Program<InternalModel>> = cx.update(|cx| {
+        InternalModel {
+            processed: Vec::new(),
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    dispatcher.dispatch(Msg::Trigger).unwrap();
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        // Internal emits have guaranteed delivery and are never dropped
+        assert_eq!(program.model().processed.as_slice(), &[1, 2, 3]);
+    });
+
+    let overflows = overflow_events.lock().unwrap();
+    assert!(
+        overflows.is_empty(),
+        "internal commands must never be dropped under DropNewest"
+    );
+}
+
+#[gpui::test]
+fn all_internal_command_kinds_delivered_when_external_queue_is_zero_capacity_reject_new(
+    cx: &mut TestAppContext,
+) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Step(&'static str),
+    }
+
+    struct AllEffectsModel {
+        processed: Vec<&'static str>,
+    }
+
+    impl Model for AllEffectsModel {
+        type Msg = Msg;
+
+        fn init(&mut self, _cx: &mut App, _scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+            Command::batch([
+                Command::emit(Msg::Step("emit")),
+                Command::foreground(|_: &mut gpui::AsyncApp| async {
+                    Some(Msg::Step("foreground"))
+                }),
+                Command::background(|_executor| async { Some(Msg::Step("background")) }),
+                Command::foreground_keyed("k1", |_: &mut gpui::AsyncApp| async {
+                    Some(Msg::Step("fg_keyed"))
+                }),
+                Command::background_keyed("k2", |_executor| async { Some(Msg::Step("bg_keyed")) }),
+            ])
+        }
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Step(val) => {
+                    self.processed.push(val);
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let config = ProgramConfig::default().queue_policy(QueuePolicy::RejectNew { capacity: 0 });
+
+    let program: Entity<Program<AllEffectsModel>> = cx.update(|cx| {
+        AllEffectsModel {
+            processed: Vec::new(),
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    // External dispatch must fail because capacity is 0:
+    let err = dispatcher.dispatch(Msg::Step("external")).unwrap_err();
+    assert!(matches!(err, gpui_tea::Error::QueueFull { .. }));
+
+    // Run all internal commands to completion
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().processed.len(), 5);
+        assert!(program.model().processed.contains(&"emit"));
+        assert!(program.model().processed.contains(&"foreground"));
+        assert!(program.model().processed.contains(&"background"));
+        assert!(program.model().processed.contains(&"fg_keyed"));
+        assert!(program.model().processed.contains(&"bg_keyed"));
+    });
+}
+
+#[gpui::test]
+fn drop_oldest_displaces_only_external_messages_protecting_internal_in_pending(
+    cx: &mut TestAppContext,
+) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        External(&'static str),
+        Internal(&'static str),
+    }
+
+    struct FifoModel {
+        processed: Vec<&'static str>,
+    }
+
+    impl Model for FifoModel {
+        type Msg = Msg;
+
+        fn init(&mut self, _cx: &mut App, _scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+            // Internal message enqueued during init sits in pending
+            Command::emit(Msg::Internal("i1"))
+        }
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::External(name) => {
+                    self.processed.push(name);
+                    Command::none()
+                }
+                Msg::Internal(name) => {
+                    self.processed.push(name);
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let overflow_events = Arc::new(Mutex::new(Vec::new()));
+    let config = ProgramConfig::default()
+        .queue_policy(QueuePolicy::DropOldest { capacity: 1 })
+        .describe_message(|msg: &Msg| match msg {
+            Msg::External(n) => format!("ext:{n}"),
+            Msg::Internal(n) => format!("int:{n}"),
+        })
+        .telemetry_observer({
+            let overflow_events = overflow_events.clone();
+            move |envelope| {
+                if let TelemetryEvent::QueueOverflow {
+                    action,
+                    message_description,
+                    ..
+                } = &envelope.event
+                {
+                    overflow_events
+                        .lock()
+                        .unwrap()
+                        .push((*action, message_description.clone()));
+                }
+            }
+        });
+
+    let program: Entity<Program<FifoModel>> = cx.update(|cx| {
+        FifoModel {
+            processed: Vec::new(),
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    // Dispatch E1
+    dispatcher.dispatch(Msg::External("e1")).unwrap();
+    // Dispatch E2 while E1 is active in capacity-1 external pool -> E2 displaces E1!
+    dispatcher.dispatch(Msg::External("e2")).unwrap();
+
+    cx.run_until_parked();
+
+    // E1 was displaced by E2.
+    // Internal message i1 was protected in pending and processed!
+    // E2 was processed!
+    let overflows = overflow_events.lock().unwrap();
+    assert_eq!(overflows.len(), 1);
+    assert_eq!(overflows[0].0, QueueOverflowAction::DroppedOldest);
+    assert_eq!(overflows[0].1.as_deref(), Some("ext:e1"));
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().processed.as_slice(), &["i1", "e2"]);
+    });
+}
+
+#[gpui::test]
+fn all_internal_command_kinds_delivered_when_external_queue_is_zero_capacity_drop_newest(
+    cx: &mut TestAppContext,
+) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Step(&'static str),
+    }
+
+    struct AllEffectsModel {
+        processed: Vec<&'static str>,
+    }
+
+    impl Model for AllEffectsModel {
+        type Msg = Msg;
+
+        fn init(&mut self, _cx: &mut App, _scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+            Command::batch([
+                Command::emit(Msg::Step("emit")),
+                Command::foreground(|_: &mut gpui::AsyncApp| async {
+                    Some(Msg::Step("foreground"))
+                }),
+                Command::background(|_executor| async { Some(Msg::Step("background")) }),
+                Command::foreground_keyed("k1", |_: &mut gpui::AsyncApp| async {
+                    Some(Msg::Step("fg_keyed"))
+                }),
+                Command::background_keyed("k2", |_executor| async { Some(Msg::Step("bg_keyed")) }),
+            ])
+        }
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Step(val) => {
+                    self.processed.push(val);
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let config = ProgramConfig::default().queue_policy(QueuePolicy::DropNewest { capacity: 0 });
+
+    let program: Entity<Program<AllEffectsModel>> = cx.update(|cx| {
+        AllEffectsModel {
+            processed: Vec::new(),
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    // External dispatch is dropped under capacity 0:
+    dispatcher.dispatch(Msg::Step("external")).unwrap();
+
+    // Run all internal commands to completion
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().processed.len(), 5);
+        assert!(program.model().processed.contains(&"emit"));
+        assert!(program.model().processed.contains(&"foreground"));
+        assert!(program.model().processed.contains(&"background"));
+        assert!(program.model().processed.contains(&"fg_keyed"));
+        assert!(program.model().processed.contains(&"bg_keyed"));
+        assert!(!program.model().processed.contains(&"external"));
+    });
+}
+
+#[gpui::test]
+fn all_internal_command_kinds_delivered_when_external_queue_is_zero_capacity_drop_oldest(
+    cx: &mut TestAppContext,
+) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Step(&'static str),
+    }
+
+    struct AllEffectsModel {
+        processed: Vec<&'static str>,
+    }
+
+    impl Model for AllEffectsModel {
+        type Msg = Msg;
+
+        fn init(&mut self, _cx: &mut App, _scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+            Command::batch([
+                Command::emit(Msg::Step("emit")),
+                Command::foreground(|_: &mut gpui::AsyncApp| async {
+                    Some(Msg::Step("foreground"))
+                }),
+                Command::background(|_executor| async { Some(Msg::Step("background")) }),
+                Command::foreground_keyed("k1", |_: &mut gpui::AsyncApp| async {
+                    Some(Msg::Step("fg_keyed"))
+                }),
+                Command::background_keyed("k2", |_executor| async { Some(Msg::Step("bg_keyed")) }),
+            ])
+        }
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Step(val) => {
+                    self.processed.push(val);
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let config = ProgramConfig::default().queue_policy(QueuePolicy::DropOldest { capacity: 0 });
+
+    let program: Entity<Program<AllEffectsModel>> = cx.update(|cx| {
+        AllEffectsModel {
+            processed: Vec::new(),
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    // Dispatch external messages; under capacity 0, newest displaces previous:
+    dispatcher.dispatch(Msg::Step("ext1")).unwrap();
+    dispatcher.dispatch(Msg::Step("ext2")).unwrap();
+
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().processed.len(), 6);
+        assert!(program.model().processed.contains(&"emit"));
+        assert!(program.model().processed.contains(&"foreground"));
+        assert!(program.model().processed.contains(&"background"));
+        assert!(program.model().processed.contains(&"fg_keyed"));
+        assert!(program.model().processed.contains(&"bg_keyed"));
+        assert!(program.model().processed.contains(&"ext2"));
+        assert!(!program.model().processed.contains(&"ext1"));
+    });
+}
+
+#[gpui::test]
+fn all_internal_command_kinds_delivered_when_external_queue_is_saturated_reject_new(
+    cx: &mut TestAppContext,
+) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Step(&'static str),
+        TriggerAll,
+    }
+
+    struct SaturatedModel {
+        processed: Vec<&'static str>,
+    }
+
+    impl Model for SaturatedModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Step(val) => {
+                    self.processed.push(val);
+                    Command::none()
+                }
+                Msg::TriggerAll => Command::batch([
+                    Command::emit(Msg::Step("emit")),
+                    Command::foreground(|_: &mut gpui::AsyncApp| async {
+                        Some(Msg::Step("foreground"))
+                    }),
+                    Command::background(|_executor| async { Some(Msg::Step("background")) }),
+                    Command::foreground_keyed("k1", |_: &mut gpui::AsyncApp| async {
+                        Some(Msg::Step("fg_keyed"))
+                    }),
+                    Command::background_keyed("k2", |_executor| async {
+                        Some(Msg::Step("bg_keyed"))
+                    }),
+                ]),
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let config = ProgramConfig::default().queue_policy(QueuePolicy::RejectNew { capacity: 2 });
+
+    let program: Entity<Program<SaturatedModel>> = cx.update(|cx| {
+        SaturatedModel {
+            processed: Vec::new(),
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    // Saturate external queue: 2 capacity
+    dispatcher.dispatch(Msg::Step("ext1")).unwrap();
+    dispatcher.dispatch(Msg::TriggerAll).unwrap();
+    let err = dispatcher.dispatch(Msg::Step("ext_rejected")).unwrap_err();
+    assert!(matches!(err, gpui_tea::Error::QueueFull { .. }));
+
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().processed.len(), 6);
+        assert!(program.model().processed.contains(&"ext1"));
+        assert!(program.model().processed.contains(&"emit"));
+        assert!(program.model().processed.contains(&"foreground"));
+        assert!(program.model().processed.contains(&"background"));
+        assert!(program.model().processed.contains(&"fg_keyed"));
+        assert!(program.model().processed.contains(&"bg_keyed"));
+        assert!(!program.model().processed.contains(&"ext_rejected"));
+    });
+}
+
+#[gpui::test]
+fn all_internal_command_kinds_delivered_when_external_queue_is_saturated_drop_newest(
+    cx: &mut TestAppContext,
+) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Step(&'static str),
+        TriggerAll,
+    }
+
+    struct SaturatedModel {
+        processed: Vec<&'static str>,
+    }
+
+    impl Model for SaturatedModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Step(val) => {
+                    self.processed.push(val);
+                    Command::none()
+                }
+                Msg::TriggerAll => Command::batch([
+                    Command::emit(Msg::Step("emit")),
+                    Command::foreground(|_: &mut gpui::AsyncApp| async {
+                        Some(Msg::Step("foreground"))
+                    }),
+                    Command::background(|_executor| async { Some(Msg::Step("background")) }),
+                    Command::foreground_keyed("k1", |_: &mut gpui::AsyncApp| async {
+                        Some(Msg::Step("fg_keyed"))
+                    }),
+                    Command::background_keyed("k2", |_executor| async {
+                        Some(Msg::Step("bg_keyed"))
+                    }),
+                ]),
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let config = ProgramConfig::default().queue_policy(QueuePolicy::DropNewest { capacity: 2 });
+
+    let program: Entity<Program<SaturatedModel>> = cx.update(|cx| {
+        SaturatedModel {
+            processed: Vec::new(),
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    // Saturate external queue: 2 capacity
+    dispatcher.dispatch(Msg::Step("ext1")).unwrap();
+    dispatcher.dispatch(Msg::TriggerAll).unwrap();
+    // 3rd external dispatch is dropped under DropNewest
+    dispatcher.dispatch(Msg::Step("ext_dropped")).unwrap();
+
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().processed.len(), 6);
+        assert!(program.model().processed.contains(&"ext1"));
+        assert!(program.model().processed.contains(&"emit"));
+        assert!(program.model().processed.contains(&"foreground"));
+        assert!(program.model().processed.contains(&"background"));
+        assert!(program.model().processed.contains(&"fg_keyed"));
+        assert!(program.model().processed.contains(&"bg_keyed"));
+        assert!(!program.model().processed.contains(&"ext_dropped"));
+    });
+}
+
+#[gpui::test]
+fn all_internal_command_kinds_delivered_when_external_queue_is_saturated_drop_oldest(
+    cx: &mut TestAppContext,
+) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Step(&'static str),
+        TriggerAll,
+    }
+
+    struct SaturatedModel {
+        processed: Vec<&'static str>,
+    }
+
+    impl Model for SaturatedModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Step(val) => {
+                    self.processed.push(val);
+                    Command::none()
+                }
+                Msg::TriggerAll => Command::batch([
+                    Command::emit(Msg::Step("emit")),
+                    Command::foreground(|_: &mut gpui::AsyncApp| async {
+                        Some(Msg::Step("foreground"))
+                    }),
+                    Command::background(|_executor| async { Some(Msg::Step("background")) }),
+                    Command::foreground_keyed("k1", |_: &mut gpui::AsyncApp| async {
+                        Some(Msg::Step("fg_keyed"))
+                    }),
+                    Command::background_keyed("k2", |_executor| async {
+                        Some(Msg::Step("bg_keyed"))
+                    }),
+                ]),
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let config = ProgramConfig::default().queue_policy(QueuePolicy::DropOldest { capacity: 2 });
+
+    let program: Entity<Program<SaturatedModel>> = cx.update(|cx| {
+        SaturatedModel {
+            processed: Vec::new(),
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    // Saturate external queue: 2 capacity
+    dispatcher.dispatch(Msg::Step("ext1")).unwrap();
+    dispatcher.dispatch(Msg::TriggerAll).unwrap();
+    // 3rd external dispatch displaces ext1 under DropOldest
+    dispatcher.dispatch(Msg::Step("ext3")).unwrap();
+
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        // ext1 was displaced. ext3, and all 5 internal commands were delivered!
+        assert_eq!(program.model().processed.len(), 6);
+        assert!(!program.model().processed.contains(&"ext1"));
+        assert!(program.model().processed.contains(&"ext3"));
+        assert!(program.model().processed.contains(&"emit"));
+        assert!(program.model().processed.contains(&"foreground"));
+        assert!(program.model().processed.contains(&"background"));
+        assert!(program.model().processed.contains(&"fg_keyed"));
+        assert!(program.model().processed.contains(&"bg_keyed"));
+    });
+}
+
+#[gpui::test]
+fn interleaved_internal_and_external_preserves_fifo_order_under_drop_oldest(
+    cx: &mut TestAppContext,
+) {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Step(&'static str),
+    }
+
+    struct InterleaveModel {
+        processed: Vec<&'static str>,
+    }
+
+    impl Model for InterleaveModel {
+        type Msg = Msg;
+
+        fn init(&mut self, _cx: &mut App, _scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+            Command::batch([
+                Command::emit(Msg::Step("i1")),
+                Command::emit(Msg::Step("i2")),
+            ])
+        }
+
+        fn update(
+            &mut self,
+            msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            match msg {
+                Msg::Step(name) => {
+                    self.processed.push(name);
+                    Command::none()
+                }
+            }
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let config = ProgramConfig::default().queue_policy(QueuePolicy::DropOldest { capacity: 1 });
+
+    let program: Entity<Program<InterleaveModel>> = cx.update(|cx| {
+        InterleaveModel {
+            processed: Vec::new(),
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    // External dispatch e1
+    dispatcher.dispatch(Msg::Step("e1")).unwrap();
+    // External dispatch e2 under capacity 1: displaces e1 in the external pool
+    dispatcher.dispatch(Msg::Step("e2")).unwrap();
+
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        // Strict FIFO order: i1, i2 (from init), then e2 (e1 was displaced by e2)
+        assert_eq!(program.model().processed.as_slice(), &["i1", "i2", "e2"]);
+    });
+}
+
+#[cfg(feature = "metrics")]
+struct TestMetricHandle {
+    key: metrics::Key,
+    seen: Arc<Mutex<Vec<metrics::Key>>>,
+}
+
+#[cfg(feature = "metrics")]
+impl metrics::CounterFn for TestMetricHandle {
+    fn increment(&self, _value: u64) {
+        self.seen.lock().unwrap().push(self.key.clone());
+    }
+    fn absolute(&self, _value: u64) {
+        self.seen.lock().unwrap().push(self.key.clone());
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl metrics::GaugeFn for TestMetricHandle {
+    fn increment(&self, _value: f64) {
+        self.seen.lock().unwrap().push(self.key.clone());
+    }
+    fn decrement(&self, _value: f64) {
+        self.seen.lock().unwrap().push(self.key.clone());
+    }
+    fn set(&self, _value: f64) {
+        self.seen.lock().unwrap().push(self.key.clone());
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl metrics::HistogramFn for TestMetricHandle {
+    fn record(&self, _value: f64) {
+        self.seen.lock().unwrap().push(self.key.clone());
+    }
+}
+
+#[cfg(feature = "metrics")]
+struct TestMetricRecorder {
+    seen: Arc<Mutex<Vec<metrics::Key>>>,
+}
+
+#[cfg(feature = "metrics")]
+impl metrics::Recorder for TestMetricRecorder {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::from_arc(Arc::new(TestMetricHandle {
+            key: key.clone(),
+            seen: self.seen.clone(),
+        }))
+    }
+    fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::from_arc(Arc::new(TestMetricHandle {
+            key: key.clone(),
+            seen: self.seen.clone(),
+        }))
+    }
+    fn register_histogram(
+        &self,
+        key: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::from_arc(Arc::new(TestMetricHandle {
+            key: key.clone(),
+            seen: self.seen.clone(),
+        }))
+    }
+}
+
+#[cfg(feature = "metrics")]
+#[gpui::test]
+fn metrics_adapter_integration_with_mounted_program_verifies_cardinality_safety(
+    cx: &mut TestAppContext,
+) {
+    use gpui_tea::{MetricsAdapter, observe_metrics_telemetry};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Ping,
+    }
+
+    struct MetricModel;
+
+    impl Model for MetricModel {
+        type Msg = Msg;
+
+        fn update(
+            &mut self,
+            _msg: Self::Msg,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+        ) -> Command<Self::Msg> {
+            Command::none()
+        }
+
+        fn view(
+            &self,
+            _window: &mut Window,
+            _cx: &mut App,
+            _scope: &ModelContext<Self::Msg>,
+            _dispatcher: &Dispatcher<Self::Msg>,
+        ) -> View {
+            div().into_view()
+        }
+    }
+
+    let has_label = |key: &metrics::Key, label_k: &str, label_v: &str| {
+        key.labels()
+            .any(|l| l.key() == label_k && l.value() == label_v)
+    };
+    let has_any_label =
+        |key: &metrics::Key, label_k: &str| key.labels().any(|l| l.key() == label_k);
+
+    // 1. Test with MetricsAdapter default (no program_id, stable program label from describe_program)
+    let seen1 = Arc::new(Mutex::new(Vec::new()));
+    let recorder1 = TestMetricRecorder {
+        seen: seen1.clone(),
+    };
+    let adapter = MetricsAdapter::new();
+    let config = ProgramConfig::default()
+        .describe_program(|_| "stable_service")
+        .telemetry_observer(adapter.observer());
+
+    metrics::with_local_recorder(&recorder1, || {
+        let program: Entity<Program<MetricModel>> =
+            cx.update(|cx| MetricModel.into_program_with(config, cx));
+        let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+        dispatcher.dispatch(Msg::Ping).unwrap();
+        cx.run_until_parked();
+    });
+
+    {
+        let keys = seen1.lock().unwrap();
+        assert!(!keys.is_empty(), "metrics must have been recorded");
+        assert!(
+            keys.iter().all(|k| !has_any_label(k, "program_id")),
+            "program_id must not be present by default"
+        );
+        assert!(
+            keys.iter()
+                .any(|k| has_label(k, "program", "stable_service")),
+            "program label must match stable_service"
+        );
+    }
+
+    // 2. Test with include_program_id explicitly enabled
+    let seen2 = Arc::new(Mutex::new(Vec::new()));
+    let recorder2 = TestMetricRecorder {
+        seen: seen2.clone(),
+    };
+    let adapter2 = MetricsAdapter::new().include_program_id(true);
+    let config2 = ProgramConfig::default()
+        .describe_program(|_| "service_with_id")
+        .telemetry_observer(adapter2.observer());
+
+    metrics::with_local_recorder(&recorder2, || {
+        let program: Entity<Program<MetricModel>> =
+            cx.update(|cx| MetricModel.into_program_with(config2, cx));
+        let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+        dispatcher.dispatch(Msg::Ping).unwrap();
+        cx.run_until_parked();
+    });
+
+    {
+        let keys = seen2.lock().unwrap();
+        assert!(
+            keys.iter().any(|k| has_any_label(k, "program_id")),
+            "program_id must be present when enabled"
+        );
+        assert!(
+            keys.iter()
+                .any(|k| has_label(k, "program", "service_with_id"))
+        );
+    }
+
+    // 3. Test with no program description and no configured name -> omits program label entirely
+    let seen3 = Arc::new(Mutex::new(Vec::new()));
+    let recorder3 = TestMetricRecorder {
+        seen: seen3.clone(),
+    };
+    let adapter3 = MetricsAdapter::new();
+    let config3 = ProgramConfig::default().telemetry_observer(adapter3.observer());
+
+    metrics::with_local_recorder(&recorder3, || {
+        let program: Entity<Program<MetricModel>> =
+            cx.update(|cx| MetricModel.into_program_with(config3, cx));
+        let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+        dispatcher.dispatch(Msg::Ping).unwrap();
+        cx.run_until_parked();
+    });
+
+    {
+        let keys = seen3.lock().unwrap();
+        assert!(
+            keys.iter().all(|k| !has_any_label(k, "program")),
+            "program label must be omitted when not provided"
+        );
+        assert!(
+            keys.iter().all(|k| !has_any_label(k, "program_id")),
+            "program_id must not be present"
+        );
+    }
+
+    // 4. Verify observe_metrics_telemetry function pointer records stable program label and omits program_id
+    let seen4 = Arc::new(Mutex::new(Vec::new()));
+    let recorder4 = TestMetricRecorder {
+        seen: seen4.clone(),
+    };
+    let config_with_fn = ProgramConfig::default()
+        .describe_program(|_| "stable_service_fn")
+        .telemetry_observer(observe_metrics_telemetry);
+
+    metrics::with_local_recorder(&recorder4, || {
+        let program: Entity<Program<MetricModel>> =
+            cx.update(|cx| MetricModel.into_program_with(config_with_fn, cx));
+        let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+        dispatcher.dispatch(Msg::Ping).unwrap();
+        cx.run_until_parked();
+    });
+
+    {
+        let keys = seen4.lock().unwrap();
+        assert!(
+            keys.iter().all(|k| !has_any_label(k, "program_id")),
+            "observe_metrics_telemetry must omit program_id"
+        );
+        assert!(
+            keys.iter()
+                .any(|k| has_label(k, "program", "stable_service_fn")),
+            "observe_metrics_telemetry must include stable program label"
+        );
+    }
 }

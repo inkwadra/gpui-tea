@@ -14,6 +14,10 @@ pub enum QueuePolicy {
         capacity: usize,
     },
     /// Drop the oldest pending message to make room for a new one.
+    ///
+    /// When queue overflow occurs under this policy, the corresponding [`super::TelemetryEvent::QueueOverflow`]
+    /// records the human-readable description of the displaced (dropped) oldest message, while
+    /// the newly admitted message is recorded via [`super::TelemetryEvent::DispatchAccepted`].
     DropOldest {
         /// The maximum number of pending messages allowed in the queue.
         capacity: usize,

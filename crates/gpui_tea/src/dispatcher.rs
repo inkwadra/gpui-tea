@@ -1,7 +1,7 @@
 use crate::{
     Error, Result,
     observability::{Observability, QueueOverflowAction, RuntimeEvent, TelemetryEvent},
-    queue::{QueueReservation, QueueTracker, QueuedMessage},
+    queue::{QueueOrigin, QueueReservation, QueueTracker, QueuedMessage},
 };
 use futures::channel::mpsc::UnboundedSender;
 use std::fmt;
@@ -28,7 +28,7 @@ impl<Msg: Send + 'static> Dispatcher<Msg> {
         Self {
             dispatch: Arc::new(move |msg: Msg| {
                 let message_description = observability.describe_message_value(&msg);
-                let reservation = queue_tracker.reserve_enqueue();
+                let reservation = queue_tracker.reserve_enqueue(message_description.clone());
 
                 match reservation {
                     QueueReservation::Rejected => {
@@ -40,7 +40,7 @@ impl<Msg: Send + 'static> Dispatcher<Msg> {
                         observability.observe_telemetry(TelemetryEvent::QueueOverflow {
                             policy: observability.queue_policy(),
                             action: QueueOverflowAction::RejectedNew,
-                            message_description,
+                            message_description: message_description.clone(),
                         });
                         Err(Error::QueueFull {
                             policy: observability.queue_policy(),
@@ -59,13 +59,17 @@ impl<Msg: Send + 'static> Dispatcher<Msg> {
                         });
                         Ok(())
                     }
-                    accepted @ QueueReservation::Accepted {
+                    ref accepted @ QueueReservation::Accepted {
                         id,
                         overflow_action,
+                        ref dropped_message_description,
                         ..
                     } => {
                         let result = sender
-                            .unbounded_send(QueuedMessage { id, message: msg })
+                            .unbounded_send(QueuedMessage {
+                                origin: QueueOrigin::External(id),
+                                message: msg,
+                            })
                             .map_err(|_| Error::ProgramUnavailable);
 
                         if let Ok(()) = &result {
@@ -73,12 +77,12 @@ impl<Msg: Send + 'static> Dispatcher<Msg> {
                                 observability.observe_runtime(RuntimeEvent::QueueOverflow {
                                     policy: observability.queue_policy(),
                                     action,
-                                    message_description: message_description.clone(),
+                                    message_description: dropped_message_description.clone(),
                                 });
                                 observability.observe_telemetry(TelemetryEvent::QueueOverflow {
                                     policy: observability.queue_policy(),
                                     action,
-                                    message_description: message_description.clone(),
+                                    message_description: dropped_message_description.clone(),
                                 });
                             }
                             observability.observe_runtime(RuntimeEvent::DispatchAccepted {

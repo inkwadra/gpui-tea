@@ -1,10 +1,8 @@
 use crate::command::{CommandInner, Effect};
 use crate::keyed_tasks::{CommandMeta, KeyedEffectContext};
 use crate::model::Model;
-use crate::observability::{
-    Observability, ProgramConfig, QueueOverflowAction, RuntimeEvent, TelemetryEvent,
-};
-use crate::queue::{AutoDrainGuard, DrainGuard, QueueReservation, QueueTracker, QueuedMessage};
+use crate::observability::{Observability, ProgramConfig, RuntimeEvent, TelemetryEvent};
+use crate::queue::{AutoDrainGuard, DrainGuard, QueueOrigin, QueueTracker, QueuedMessage};
 use crate::runtime::{EffectId, Runtime};
 use crate::{Command, CommandKind, Dispatcher, Key, ModelContext};
 use futures::StreamExt;
@@ -25,6 +23,13 @@ pub struct RuntimeSnapshot {
 }
 
 /// Host a mounted [`Model`] inside the GPUI runtime.
+///
+/// # Panic Safety Contract
+///
+/// If [`Model::update()`] panics during message queue draining, internal RAII guards
+/// automatically restore the queue's drain state (`is_draining = false`). Any remaining
+/// messages that were already queued in the program are retained in the pending queue and will be
+/// processed upon the next message dispatch.
 pub struct Program<M: Model> {
     model: M,
     runtime: Runtime<M::Msg>,
@@ -157,7 +162,9 @@ impl<M: Model> Program<M> {
     }
 
     fn receive_enqueued(&mut self, queued: QueuedMessage<M::Msg>, cx: &mut Context<'_, Self>) {
-        if self.runtime.queue_tracker.take_if_dropped(queued.id) {
+        if let QueueOrigin::External(id) = queued.origin
+            && self.runtime.queue_tracker.take_if_dropped(id)
+        {
             return;
         }
 
@@ -168,73 +175,20 @@ impl<M: Model> Program<M> {
         }
     }
 
-    fn enqueue_message(&mut self, message: M::Msg, cx: &mut Context<'_, Self>) {
-        let message_description = self.runtime.observability.describe_message_value(&message);
-        let reservation = self.runtime.queue_tracker.reserve_enqueue();
-
-        match reservation {
-            QueueReservation::Rejected => {
-                self.runtime
-                    .observability
-                    .observe_runtime(RuntimeEvent::QueueOverflow {
-                        policy: self.runtime.observability.queue_policy(),
-                        action: QueueOverflowAction::RejectedNew,
-                        message_description: message_description.clone(),
-                    });
-                self.runtime
-                    .observability
-                    .observe_telemetry(TelemetryEvent::QueueOverflow {
-                        policy: self.runtime.observability.queue_policy(),
-                        action: QueueOverflowAction::RejectedNew,
-                        message_description,
-                    });
-            }
-            QueueReservation::DroppedNewest => {
-                self.runtime
-                    .observability
-                    .observe_runtime(RuntimeEvent::QueueOverflow {
-                        policy: self.runtime.observability.queue_policy(),
-                        action: QueueOverflowAction::DroppedNewest,
-                        message_description: message_description.clone(),
-                    });
-                self.runtime
-                    .observability
-                    .observe_telemetry(TelemetryEvent::QueueOverflow {
-                        policy: self.runtime.observability.queue_policy(),
-                        action: QueueOverflowAction::DroppedNewest,
-                        message_description,
-                    });
-            }
-            QueueReservation::Accepted {
-                id,
-                overflow_action,
-                ..
-            } => {
-                if let Some(action) = overflow_action {
-                    self.runtime
-                        .observability
-                        .observe_runtime(RuntimeEvent::QueueOverflow {
-                            policy: self.runtime.observability.queue_policy(),
-                            action,
-                            message_description: message_description.clone(),
-                        });
-                    self.runtime
-                        .observability
-                        .observe_telemetry(TelemetryEvent::QueueOverflow {
-                            policy: self.runtime.observability.queue_policy(),
-                            action,
-                            message_description: message_description.clone(),
-                        });
-                }
-
-                self.receive_enqueued(QueuedMessage { id, message }, cx);
-            }
+    fn enqueue_internal_message(&mut self, message: M::Msg, cx: &mut Context<'_, Self>) {
+        self.runtime.queue.pending.push_back(QueuedMessage {
+            origin: QueueOrigin::Internal,
+            message,
+        });
+        self.observe_queue_warning_if_needed();
+        if self.runtime.queue.should_auto_drain() {
+            self.drain_queue(cx);
         }
     }
 
     fn observe_queue_warning_if_needed(&self) {
         if let Some(threshold) = self.runtime.observability.queue_warning_threshold() {
-            let queued = self.runtime.queue_tracker.depth();
+            let queued = self.runtime.queue.pending.len();
             if queued > threshold {
                 self.runtime
                     .observability
@@ -263,11 +217,13 @@ impl<M: Model> Program<M> {
         let mut processed = 0;
 
         while let Some(queued) = self.runtime.queue.pending.pop_front() {
-            if self.runtime.queue_tracker.take_if_dropped(queued.id) {
-                continue;
-            }
+            if let QueueOrigin::External(id) = queued.origin {
+                if self.runtime.queue_tracker.take_if_dropped(id) {
+                    continue;
+                }
 
-            self.runtime.queue_tracker.complete_processed(queued.id);
+                self.runtime.queue_tracker.complete_processed(id);
+            }
             let message_description = self
                 .runtime
                 .observability
@@ -321,7 +277,7 @@ impl<M: Model> Program<M> {
                 let meta = CommandMeta::new(CommandKind::Emit, label);
                 self.observe_command_scheduled(&meta, None);
                 self.observe_effect_completed(&meta, None, Some(&message));
-                self.enqueue_message(message, cx);
+                self.enqueue_internal_message(message, cx);
             }
             CommandInner::Batch(commands) => {
                 for command in commands {
@@ -379,6 +335,8 @@ impl<M: Model> Program<M> {
                 }
             }
             CommandInner::Cancel(key) => {
+                let meta = CommandMeta::new(CommandKind::Cancel, label);
+                self.observe_command_scheduled(&meta, Some(&key));
                 self.cancel_keyed_command(&key);
             }
         }
@@ -493,7 +451,7 @@ impl<M: Model> Program<M> {
                         .clear_current(&keyed.key, keyed.generation);
                     self.observe_effect_completed(meta, Some(&keyed.key), message.as_ref());
                     if let Some(message) = message {
-                        self.enqueue_message(message, cx);
+                        self.enqueue_internal_message(message, cx);
                     }
                 } else {
                     let key_description = self.runtime.observability.describe_key_value(&keyed.key);
@@ -532,7 +490,7 @@ impl<M: Model> Program<M> {
                 self.observe_effect_completed(meta, None, message.as_ref());
 
                 if let Some(message) = message {
-                    self.enqueue_message(message, cx);
+                    self.enqueue_internal_message(message, cx);
                 }
             }
         }
@@ -733,9 +691,10 @@ mod runtime_tests {
     }
 
     #[gpui::test]
-    fn internal_enqueue_respects_reject_new_policy_without_extra_notify(cx: &mut TestAppContext) {
+    fn internal_commands_have_guaranteed_delivery_under_reject_new_policy(cx: &mut TestAppContext) {
         struct RejectModel {
             renders: Arc<Mutex<usize>>,
+            processed: Arc<Mutex<Vec<i32>>>,
         }
 
         impl Model for RejectModel {
@@ -748,10 +707,14 @@ mod runtime_tests {
                 _scope: &ModelContext<Self::Msg>,
             ) -> Command<Self::Msg> {
                 match msg {
-                    Msg::Set(0) => {
-                        Command::batch([Command::emit(Msg::Set(1)), Command::emit(Msg::Set(2))])
+                    Msg::Set(val) => {
+                        self.processed.lock().unwrap().push(val);
+                        if val == 0 {
+                            Command::batch([Command::emit(Msg::Set(1)), Command::emit(Msg::Set(2))])
+                        } else {
+                            Command::none()
+                        }
                     }
-                    Msg::Set(_) => Command::none(),
                 }
             }
 
@@ -768,9 +731,11 @@ mod runtime_tests {
         }
 
         let renders = Arc::new(Mutex::new(0));
+        let processed = Arc::new(Mutex::new(Vec::new()));
         let program: Entity<Program<RejectModel>> = cx.update(|cx| {
             RejectModel {
                 renders: renders.clone(),
+                processed: processed.clone(),
             }
             .into_program_with(
                 ProgramConfig::default().queue_policy(QueuePolicy::RejectNew { capacity: 1 }),
@@ -784,6 +749,7 @@ mod runtime_tests {
 
         let snapshot = program.read_with(cx, |program, _cx| program.runtime_snapshot());
         assert_eq!(snapshot.queue_depth, 0);
+        assert_eq!(processed.lock().unwrap().as_slice(), &[0, 1, 2]);
     }
 
     #[gpui::test]
