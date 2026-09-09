@@ -18,6 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add RAII drain/auto-drain guards so a panic in `Model::update` no longer freezes the message
   queue.
 - Allow `DropOldest` with `capacity: 0` to accept a message when there is nothing to displace.
+- Add `MetricsAdapterConfig` and `MetricsAdapter` builder to customize metric label emissions,
+  supporting stable `"program"` labels from `program_name` or `program_description` and keeping
+  monotonic `program_id` optional.
+- Add `CommandKind::Cancel` variant so keyed command cancellations are observable via
+  `TelemetryEvent::CommandScheduled`.
+- Add diagnostic compiler errors in `Composite` derive macro when `#[child]` is placed on a struct
+  or `#[composite]` is placed on a field.
+- Add trybuild UI compile-fail tests for unsupported item types (enums, unions, tuple structs) and
+  missing child attributes (`path`, `lift`, `extract`).
+- Add trybuild UI compile-pass tests for generic `Composite` structs, closures in `lift`/`extract`,
+  raw identifiers, and zero-child models.
+- Add integration tests for bounded queue policies under mounted programs, internal command delivery
+  guarantees, and effect / subscription cancellations on program drop.
+- Add release workflow checks validating git tag version against `Cargo.toml` and ensuring macro
+  dependencies are published to crates.io before `gpui_tea`.
 
 ### Changed
 
@@ -30,12 +45,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and do not re-run the builder.
 - Reject empty `#[child(path = "...")]` values in the `Composite` derive.
 - Generate `Composite` helpers with `#[allow(dead_code)]` and point type errors at the child field.
+- Change `observe_metrics_telemetry` to omit monotonic `program_id` labels by default to prevent
+  high cardinality in Prometheus-compatible metric collectors.
+- Guarantee delivery for internal model messages (`Command::emit` and async effect completions) so
+  they bypass bounded `QueuePolicy` limits and are never dropped or displaced by external dispatches.
+- Change `Composite` expansion for zero-child structs to emit `_cx` and `_scope` parameters,
+  avoiding unused variable warnings under `#![deny(warnings)]`.
 
 ### Fixed
 
 - Do not emit `EffectCompleted` for stale keyed completions; only `StaleKeyedCompletionIgnored`
   is emitted.
 - Avoid `usize` underflow when resuming auto-drain suspension in release builds.
+- Fix `QueuePolicy::DropOldest` overflow telemetry to describe the displaced/dropped old message
+  rather than the newly accepted message.
+- Fix `Command::cancel_key` to preserve command labels and emit `TelemetryEvent::CommandScheduled`.
 
 ## [0.1.1] - 2026-03-24
 
