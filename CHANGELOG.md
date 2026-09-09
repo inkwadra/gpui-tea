@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > `gpui_tea_macros-v0.1.0`) instead of plain `vX.Y.Z` tags. This changelog uses the shared
 > workspace version heading for readability and links to the canonical `gpui_tea` release tag.
 
+## [Unreleased]
+
+### Added
+
+- Add `RuntimeEvent::QueueOverflow` so runtime observers can see queue backpressure without
+  enabling the telemetry pipeline.
+- Add RAII drain/auto-drain guards so a panic in `Model::update` no longer freezes the message
+  queue.
+- Allow `DropOldest` with `capacity: 0` to accept a message when there is nothing to displace.
+
+### Changed
+
+- Stop enabling `gpui`'s `test-support` feature for downstream consumers; it is now a
+  dev-dependency only.
+- Move `tracing-subscriber` out of the `tracing` feature so library consumers no longer compile
+  it; examples and tests still use it via dev-dependencies.
+- Mark `CommandKind` as `#[non_exhaustive]` to leave room for future command kinds.
+- Document retain-by-key subscription semantics: retained keys keep the previously built resource
+  and do not re-run the builder.
+- Reject empty `#[child(path = "...")]` values in the `Composite` derive.
+- Generate `Composite` helpers with `#[allow(dead_code)]` and point type errors at the child field.
+
+### Fixed
+
+- Do not emit `EffectCompleted` for stale keyed completions; only `StaleKeyedCompletionIgnored`
+  is emitted.
+- Avoid `usize` underflow when resuming auto-drain suspension in release builds.
+
 ## [0.1.1] - 2026-03-24
 
 ### Added

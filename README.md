@@ -42,8 +42,8 @@ support for nested models through `ChildScope` and the `Composite` derive macro.
 ## Requirements
 
 - Rust stable toolchain. The repository pins the `stable` channel in `rust-toolchain.toml`.
-- A Cargo toolchain that supports Rust 2024 edition crates. The manifest does not declare a
-  separate `rust-version`.
+- A Cargo toolchain that supports Rust 2024 edition crates. The workspace declares
+  `rust-version = "1.88"`.
 - For local development in this repository: `clippy`, `rustfmt`, and `typos`.
 - For running the interactive examples: a desktop environment capable of opening GPUI windows.
 
