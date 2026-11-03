@@ -1,9 +1,10 @@
 use crate::spec::{ChildSpec, CompositeSpec};
 use quote::{quote, quote_spanned};
-use syn::Type;
+use syn::{Type, Visibility};
 
 pub(crate) fn expand_composite(spec: CompositeSpec) -> proc_macro2::TokenStream {
     let CompositeSpec {
+        struct_vis,
         struct_ident,
         generics,
         message_ty,
@@ -17,7 +18,9 @@ pub(crate) fn expand_composite(spec: CompositeSpec) -> proc_macro2::TokenStream 
     let init_body = init_body(&children);
     let update_steps = children.iter().map(update_step);
     let subscription_steps = children.iter().map(subscription_step);
-    let view_methods = children.iter().map(|child| view_method(child, &message_ty));
+    let view_methods = children
+        .iter()
+        .map(|child| view_method(child, &struct_vis, &message_ty));
     let (cx_ident, scope_ident) = if children.is_empty() {
         (quote!(_cx), quote!(_scope))
     } else {
@@ -40,19 +43,19 @@ pub(crate) fn expand_composite(spec: CompositeSpec) -> proc_macro2::TokenStream 
             #(#binding_methods)*
 
             #[doc(hidden)]
-            fn __composite_init(
+            #struct_vis fn __composite_init(
                 &mut self,
-                #cx_ident: &mut ::gpui::App,
+                #cx_ident: &mut ::gpui_tea::__private::gpui::App,
                 #scope_ident: &::gpui_tea::ModelContext<#message_ty>,
             ) -> ::gpui_tea::Command<#message_ty> {
                 #init_body
             }
 
             #[doc(hidden)]
-            fn __composite_update(
+            #struct_vis fn __composite_update(
                 &mut self,
                 msg: #message_ty,
-                #cx_ident: &mut ::gpui::App,
+                #cx_ident: &mut ::gpui_tea::__private::gpui::App,
                 #scope_ident: &::gpui_tea::ModelContext<#message_ty>,
             ) -> ::core::result::Result<::gpui_tea::Command<#message_ty>, #message_ty> {
                 #(#update_steps)*
@@ -60,9 +63,9 @@ pub(crate) fn expand_composite(spec: CompositeSpec) -> proc_macro2::TokenStream 
             }
 
             #[doc(hidden)]
-            fn __composite_subscriptions(
+            #struct_vis fn __composite_subscriptions(
                 &self,
-                #cx_ident: &mut ::gpui::App,
+                #cx_ident: &mut ::gpui_tea::__private::gpui::App,
                 #scope_ident: &::gpui_tea::ModelContext<#message_ty>,
             ) -> ::gpui_tea::Subscriptions<#message_ty> {
                 #subscriptions_body
@@ -161,7 +164,11 @@ fn subscription_step(child: &ChildSpec) -> proc_macro2::TokenStream {
     }
 }
 
-fn view_method(child: &ChildSpec, message_ty: &Type) -> proc_macro2::TokenStream {
+fn view_method(
+    child: &ChildSpec,
+    struct_vis: &Visibility,
+    message_ty: &Type,
+) -> proc_macro2::TokenStream {
     let view_ident = child.view_method_ident();
     let bindings_method_ident = child.bindings_method_ident();
     let field_ident = &child.field_ident;
@@ -169,10 +176,10 @@ fn view_method(child: &ChildSpec, message_ty: &Type) -> proc_macro2::TokenStream
 
     quote! {
         #[doc(hidden)]
-        fn #view_ident(
+        #struct_vis fn #view_ident(
             &self,
-            window: &mut ::gpui::Window,
-            cx: &mut ::gpui::App,
+            window: &mut ::gpui_tea::__private::gpui::Window,
+            cx: &mut ::gpui_tea::__private::gpui::App,
             scope: &::gpui_tea::ModelContext<#message_ty>,
             dispatcher: &::gpui_tea::Dispatcher<#message_ty>,
         ) -> ::gpui_tea::View {
@@ -194,6 +201,7 @@ mod tests {
     #[test]
     fn expansion_emits_shared_bindings_helper_per_child() {
         let spec = CompositeSpec {
+            struct_vis: parse_quote!(),
             struct_ident: parse_quote!(Parent),
             generics: parse_quote!(<T>),
             message_ty: parse_quote!(ParentMsg),
@@ -219,6 +227,7 @@ mod tests {
     #[test]
     fn expansion_allows_dead_code_on_generated_helpers() {
         let spec = CompositeSpec {
+            struct_vis: parse_quote!(),
             struct_ident: parse_quote!(Parent),
             generics: parse_quote!(),
             message_ty: parse_quote!(ParentMsg),
@@ -232,6 +241,7 @@ mod tests {
     #[test]
     fn expansion_without_children_uses_prefixed_context_parameters() {
         let spec = CompositeSpec {
+            struct_vis: parse_quote!(),
             struct_ident: parse_quote!(Parent),
             generics: parse_quote!(),
             message_ty: parse_quote!(ParentMsg),
@@ -239,7 +249,23 @@ mod tests {
         };
 
         let tokens = expand_composite(spec).to_token_stream().to_string();
-        assert!(tokens.contains("_cx : & mut :: gpui :: App"));
+        assert!(tokens.contains("_cx : & mut :: gpui_tea :: __private :: gpui :: App"));
         assert!(tokens.contains("_scope : & :: gpui_tea :: ModelContext < ParentMsg >"));
+    }
+
+    #[test]
+    fn expansion_gives_helpers_the_struct_visibility() {
+        let spec = CompositeSpec {
+            struct_vis: parse_quote!(pub(crate)),
+            struct_ident: parse_quote!(Parent),
+            generics: parse_quote!(),
+            message_ty: parse_quote!(ParentMsg),
+            children: vec![],
+        };
+
+        let tokens = expand_composite(spec).to_token_stream().to_string();
+        assert!(tokens.contains("pub (crate) fn __composite_init"));
+        assert!(tokens.contains("pub (crate) fn __composite_update"));
+        assert!(tokens.contains("pub (crate) fn __composite_subscriptions"));
     }
 }

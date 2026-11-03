@@ -1,6 +1,6 @@
 use crate::Dispatcher;
 use crate::keyed_tasks::KeyedTasks;
-use crate::observability::Observability;
+use crate::observability::{Observability, RuntimeEvent, TelemetryEvent};
 use crate::queue::{MessageQueue, QueueTracker};
 use crate::subscription_registry::SubscriptionRegistry;
 use gpui::Task;
@@ -42,19 +42,21 @@ impl PendingEffects {
 /// Internal runtime state.
 pub(crate) struct Runtime<Msg: Send + 'static> {
     pub(crate) queue: MessageQueue<Msg>,
-    pub(crate) queue_tracker: Arc<QueueTracker>,
+    pub(crate) queue_tracker: Arc<QueueTracker<Msg>>,
     pub(crate) tasks: KeyedTasks,
     pub(crate) effects: PendingEffects,
     pub(crate) subscriptions: SubscriptionRegistry,
     pub(crate) dispatcher: Dispatcher<Msg>,
     pub(crate) observability: Observability<Msg>,
+    /// Deferred drain scheduled after a drain exhausted its budget.
+    pub(crate) drain_continuation: Option<Task<()>>,
     pub(crate) _receive_task: Task<()>,
 }
 
 impl<Msg: Send + 'static> Runtime<Msg> {
     pub(crate) fn new(
         dispatcher: Dispatcher<Msg>,
-        queue_tracker: Arc<QueueTracker>,
+        queue_tracker: Arc<QueueTracker<Msg>>,
         receive_task: Task<()>,
         observability: Observability<Msg>,
     ) -> Self {
@@ -66,7 +68,20 @@ impl<Msg: Send + 'static> Runtime<Msg> {
             subscriptions: SubscriptionRegistry::default(),
             dispatcher,
             observability,
+            drain_continuation: None,
             _receive_task: receive_task,
         }
+    }
+}
+
+impl<Msg: Send + 'static> Drop for Runtime<Msg> {
+    fn drop(&mut self) {
+        // Outstanding dispatchers must fail fast and release queued messages once the program is
+        // gone; they would otherwise keep them alive for as long as any dispatcher clone exists.
+        self.queue_tracker.close();
+        self.observability
+            .observe_runtime(RuntimeEvent::ProgramUnmounted);
+        self.observability
+            .observe_telemetry(TelemetryEvent::ProgramUnmounted);
     }
 }

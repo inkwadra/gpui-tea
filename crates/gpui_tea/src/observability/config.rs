@@ -12,6 +12,9 @@ use std::{
 
 static NEXT_PROGRAM_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Default number of messages a single drain processes before yielding to the executor.
+const DEFAULT_DRAIN_BUDGET: usize = 1024;
+
 type RuntimeObserverFn<Msg> = Arc<dyn for<'a> Fn(RuntimeEvent<'a, Msg>) + Send + Sync>;
 type TelemetryObserverFn<Msg> = Arc<dyn for<'a> Fn(TelemetryEnvelope<'a, Msg>) + Send + Sync>;
 type DescribeMessageFn<Msg> = Arc<dyn Fn(&Msg) -> Arc<str> + Send + Sync>;
@@ -52,6 +55,7 @@ impl fmt::Display for ProgramId {
 pub struct ProgramConfig<Msg> {
     pub(crate) queue_warning_threshold: Option<usize>,
     pub(crate) queue_policy: super::QueuePolicy,
+    pub(crate) drain_budget: usize,
     pub(crate) observer: Option<RuntimeObserverFn<Msg>>,
     pub(crate) telemetry_observer: Option<TelemetryObserverFn<Msg>>,
     pub(crate) describe_message: Option<DescribeMessageFn<Msg>>,
@@ -64,6 +68,7 @@ impl<Msg> Clone for ProgramConfig<Msg> {
         Self {
             queue_warning_threshold: self.queue_warning_threshold,
             queue_policy: self.queue_policy,
+            drain_budget: self.drain_budget,
             observer: self.observer.clone(),
             telemetry_observer: self.telemetry_observer.clone(),
             describe_message: self.describe_message.clone(),
@@ -78,6 +83,7 @@ impl<Msg> Default for ProgramConfig<Msg> {
         Self {
             queue_warning_threshold: None,
             queue_policy: super::QueuePolicy::Unbounded,
+            drain_budget: DEFAULT_DRAIN_BUDGET,
             observer: None,
             telemetry_observer: None,
             describe_message: None,
@@ -93,6 +99,7 @@ impl<Msg> fmt::Debug for ProgramConfig<Msg> {
             .debug_struct("ProgramConfig")
             .field("queue_warning_threshold", &self.queue_warning_threshold)
             .field("queue_policy", &self.queue_policy)
+            .field("drain_budget", &self.drain_budget)
             .field("has_observer", &self.observer.is_some())
             .field("has_telemetry_observer", &self.telemetry_observer.is_some())
             .field("has_message_describer", &self.describe_message.is_some())
@@ -110,8 +117,14 @@ impl<Msg> ProgramConfig<Msg> {
 
     /// Emit queue warning events whenever the current queue depth is greater than `threshold`.
     ///
+    /// The queue depth counts every accepted message that has not been processed yet: external
+    /// dispatches still waiting for the program as well as pending internal messages. It is the
+    /// same value reported by [`crate::RuntimeSnapshot::queue_depth`] and
+    /// [`super::TelemetryMetadata::queue_depth`].
+    ///
     /// Warnings are level-triggered: every enqueue that keeps the depth above the threshold emits
     /// another event. Use a higher threshold or filter events if a burst would be too noisy.
+    /// Warnings for external dispatches are emitted on the dispatching thread.
     pub fn queue_warning_threshold(mut self, threshold: usize) -> Self {
         self.queue_warning_threshold = Some(threshold);
         self
@@ -120,6 +133,18 @@ impl<Msg> ProgramConfig<Msg> {
     /// Set the queue backpressure policy used by the runtime.
     pub fn queue_policy(mut self, queue_policy: super::QueuePolicy) -> Self {
         self.queue_policy = queue_policy;
+        self
+    }
+
+    /// Limit how many messages a single queue drain processes before yielding to the GPUI
+    /// executor.
+    ///
+    /// When the budget is exhausted, the runtime reconciles subscriptions, notifies the view, and
+    /// schedules the remaining messages on the foreground executor, so long `emit` chains cannot
+    /// block rendering or starve external dispatches. Message order is preserved. Values below
+    /// `1` are treated as `1`. Defaults to `1024`.
+    pub fn drain_budget(mut self, budget: usize) -> Self {
+        self.drain_budget = budget.max(1);
         self
     }
 

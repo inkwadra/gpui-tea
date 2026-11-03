@@ -1,5 +1,9 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 /// Define how the runtime handles queue backpressure.
+///
+/// Capacities bound the externally dispatched messages that have not been processed yet.
+/// Messages produced by commands and effects are never limited by the policy.
 pub enum QueuePolicy {
     /// Accept every message without applying a capacity limit.
     Unbounded,
@@ -14,6 +18,9 @@ pub enum QueuePolicy {
         capacity: usize,
     },
     /// Drop the oldest pending message to make room for a new one.
+    ///
+    /// A displaced message is released immediately when the program has not taken it yet, so
+    /// the policy bounds memory as well as queue depth.
     ///
     /// When queue overflow occurs under this policy, the corresponding [`super::TelemetryEvent::QueueOverflow`]
     /// records the human-readable description of the displaced (dropped) oldest message, while
@@ -37,6 +44,7 @@ impl QueuePolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 /// Describe the action taken when a queue reaches capacity.
 pub enum QueueOverflowAction {
     /// Reject the newly submitted message.

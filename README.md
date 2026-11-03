@@ -42,8 +42,10 @@ support for nested models through `ChildScope` and the `Composite` derive macro.
 ## Requirements
 
 - Rust stable toolchain. The repository pins the `stable` channel in `rust-toolchain.toml`.
-- A Cargo toolchain that supports Rust 2024 edition crates. The workspace declares
-  `rust-version = "1.88"`.
+- Rust 1.98 or newer. The workspace declares `rust-version = "1.98"`, following the toolchain
+  that Zed uses to build GPUI.
+- GPUI from the Zed repository (`https://github.com/zed-industries/zed`). `gpui_tea` tracks Zed's
+  default branch rather than the `gpui` releases on crates.io.
 - For local development in this repository: `clippy`, `rustfmt`, and `typos`.
 - For running the interactive examples: a desktop environment capable of opening GPUI windows.
 
@@ -52,25 +54,35 @@ servers.
 
 ## Installation
 
-Add the crate from crates.io:
+`gpui_tea` depends on GPUI from Zed's Git repository. Add it together with GPUI and
+`gpui_platform`, which provides the platform backend that `application()` starts:
 
-```bash
-cargo add gpui_tea
+```toml
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "wayland", "x11"] }
+gpui_tea = { git = "https://github.com/inkwadra/gpui-tea" }
 ```
 
 Enable optional telemetry integrations as needed:
 
-```bash
-cargo add gpui_tea --features tracing
-cargo add gpui_tea --features metrics
+```toml
+gpui_tea = { git = "https://github.com/inkwadra/gpui-tea", features = ["tracing", "metrics"] }
 ```
 
-To depend on the current repository state instead of a crates.io release, use a Git dependency:
+Cargo only unifies Git dependencies that use the same URL and reference. Declare `gpui` exactly as
+above (no `branch`, `tag`, or `rev`) so your application and `gpui_tea` share one GPUI build; the
+exact commit is pinned by your `Cargo.lock`. If you pin GPUI to a specific revision, redirect
+`gpui_tea`'s GPUI to it with a patch:
 
 ```toml
-[dependencies]
-gpui_tea = { git = "https://github.com/inkwadra/gpui-tea" }
+[patch."https://github.com/zed-industries/zed"]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "<commit>" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "<commit>" }
 ```
+
+The `0.1.x` releases on crates.io are built against `gpui` 0.2.2 from crates.io and do not
+include the changes on the default branch.
 
 To build the workspace test suite from source:
 
@@ -103,10 +115,14 @@ use.
 Use `ProgramConfig` when you need queue controls or observability hooks:
 
 - `queue_policy(QueuePolicy)` selects unbounded, reject-new, drop-newest, or drop-oldest
-  backpressure behavior. Under drop policies, `dispatch()` may still return `Ok(())` even when a
-  message is discarded or an older queued message is displaced.
-- `queue_warning_threshold(usize)` emits queue warning events whenever the current queue depth is
-  greater than the threshold.
+  backpressure behavior for external dispatches. Under drop policies, `dispatch()` may still
+  return `Ok(())` even when a message is discarded or an older queued message is displaced.
+  Displaced messages are released immediately, so bounded policies also bound memory.
+- `queue_warning_threshold(usize)` emits queue warning events whenever the queue depth (accepted
+  external and internal messages that are not processed yet) is greater than the threshold. This
+  is the same depth reported by `RuntimeSnapshot::queue_depth` and telemetry metadata.
+- `drain_budget(usize)` caps how many messages one queue drain processes before yielding to the
+  GPUI executor (default `1024`), so long `emit` chains cannot freeze rendering.
 - `observer(...)` receives high-level `RuntimeEvent` values.
 - `telemetry_observer(...)` receives structured `TelemetryEnvelope` values.
 - `describe_message(...)`, `describe_key(...)`, and `describe_program(...)` attach readable
@@ -127,8 +143,9 @@ The usual flow is:
 The smallest working shape looks like this:
 
 ```rust
-use gpui::{App, Application, Bounds, Window, WindowBounds, WindowOptions, div, px, size};
+use gpui::{App, Bounds, Window, WindowBounds, WindowOptions, div, px, size};
 use gpui::prelude::*;
+use gpui_platform::application;
 use gpui_tea::{Command, Dispatcher, IntoView, Model, ModelContext, Program, View};
 
 #[derive(Clone, Copy)]
@@ -172,7 +189,7 @@ impl Model for Counter {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    application().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(640.0), px(480.0)), cx);
 
         cx.open_window(
@@ -264,8 +281,12 @@ pub fn mount_with(model: M, config: ProgramConfig<M::Msg>, cx: &mut App) -> Enti
 - Parameters: `model` is the initial state, `config` customizes queue and observability behavior,
   and `cx` is the GPUI application context.
 - Behavior: mounting immediately calls `Model::init()`, executes its returned command through the
-  normal queue-drain model, drains all causally enqueued synchronous init messages, and then
-  performs the initial subscription reconciliation before returning.
+  normal queue-drain model, drains causally enqueued synchronous init messages up to the drain
+  budget, and then performs the initial subscription reconciliation before returning.
+- Externally dispatched messages are delivered in batches: everything waiting when the program
+  wakes up is processed in one drain, followed by one subscription reconciliation and one view
+  notification.
+- Panics in `Model` callbacks are fatal: GPUI leaves the panicking program entity unusable.
 - Return type: `Entity<Program<M>>`.
 
 Example:
@@ -357,7 +378,8 @@ struct Parent {
   back to the child. Sibling child paths must be unique within the derive target.
 - Generated helpers: the macro adds hidden aggregate methods `__composite_init`,
   `__composite_update`, and `__composite_subscriptions`, plus one hidden `<field>_view` helper per
-  child field.
+  child field. The helpers share the struct's visibility, so the `Model` implementation may live
+  in another module, and the generated code does not require a direct `gpui` dependency.
 - Manual `ModelContext::scope(...)` remains more flexible, but the caller is responsible for
   choosing path segments that remain stable and unique for the child lifecycle.
 

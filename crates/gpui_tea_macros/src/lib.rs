@@ -29,6 +29,10 @@ use syn::{DeriveInput, parse_macro_input};
 /// `__composite_subscriptions` helper panics if two child subscriptions collide.
 ///
 /// Generated `<field>_view` methods must not collide with inherent methods on the same type.
+///
+/// The aggregate and view helpers share the visibility of the struct, so a `Model` implementation
+/// may live in a different module than the derive target. Generated code reaches GPUI through
+/// `gpui_tea`, so the derive does not require a direct `gpui` dependency.
 #[proc_macro_derive(Composite, attributes(composite, child))]
 pub fn derive_composite(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

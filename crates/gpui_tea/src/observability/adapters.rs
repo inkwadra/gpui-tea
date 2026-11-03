@@ -4,6 +4,15 @@ use super::{TelemetryEnvelope, TelemetryEvent};
 #[cfg(any(feature = "tracing", feature = "metrics"))]
 use std::sync::Arc;
 
+#[cfg(feature = "metrics")]
+use super::ProgramId;
+#[cfg(feature = "metrics")]
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{LazyLock, Mutex, PoisonError},
+};
+
 #[cfg(feature = "tracing")]
 /// Record a [`TelemetryEnvelope`] as `tracing` events.
 ///
@@ -301,6 +310,16 @@ pub fn observe_tracing_telemetry<Msg>(envelope: TelemetryEnvelope<'_, Msg>) {
                 remaining = remaining as u64,
             );
         }
+        TelemetryEvent::ProgramUnmounted => {
+            event!(
+                Level::DEBUG,
+                event_name = "program.unmounted",
+                program_id,
+                event_id,
+                queue_depth,
+                program_description,
+            );
+        }
     }
 }
 
@@ -373,7 +392,15 @@ impl From<MetricsAdapterConfig> for MetricsAdapter {
 }
 
 #[cfg(feature = "metrics")]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default)]
+/// Last gauge values contributed by one mounted program.
+struct ProgramGauges {
+    queue_depth: usize,
+    active_subscriptions: usize,
+}
+
+#[cfg(feature = "metrics")]
+#[derive(Clone, Default)]
 /// An adapter that records [`TelemetryEnvelope`] events as `metrics` counters and gauges.
 ///
 /// # Label Cardinality
@@ -385,8 +412,27 @@ impl From<MetricsAdapterConfig> for MetricsAdapter {
 /// Per-instance `"program_id"` labels are disabled by default to prevent unbounded
 /// cardinality in systems where programs are created and destroyed frequently. If per-instance
 /// identification is desired, enable it explicitly via [`MetricsAdapter::include_program_id`].
+///
+/// # Gauges
+///
+/// Several programs can share one label set, so the `gpui_tea.queue.depth` and
+/// `gpui_tea.subscription.active` gauges are updated with per-program deltas rather than
+/// absolute values: each series reports the sum over the programs that share its labels. A
+/// program's contribution is removed when it emits [`TelemetryEvent::ProgramUnmounted`].
+/// Clones of an adapter share this bookkeeping.
 pub struct MetricsAdapter {
     config: MetricsAdapterConfig,
+    gauges: Arc<Mutex<HashMap<ProgramId, ProgramGauges>>>,
+}
+
+#[cfg(feature = "metrics")]
+impl fmt::Debug for MetricsAdapter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetricsAdapter")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "metrics")]
@@ -400,7 +446,10 @@ impl MetricsAdapter {
     /// Create a new metrics adapter with the specified configuration.
     #[must_use]
     pub fn with_config(config: MetricsAdapterConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            gauges: Arc::default(),
+        }
     }
 
     /// Set whether to include `"program_id"` labels on emitted metrics.
@@ -432,9 +481,8 @@ impl MetricsAdapter {
     }
 
     /// Record a [`TelemetryEnvelope`] as `metrics` counters and gauges.
-    #[allow(clippy::cast_precision_loss)]
     pub fn observe<Msg>(&self, envelope: TelemetryEnvelope<'_, Msg>) {
-        use metrics::{Label, counter, gauge};
+        use metrics::{Label, counter};
 
         let TelemetryEnvelope { metadata, event } = envelope;
 
@@ -460,7 +508,17 @@ impl MetricsAdapter {
             ));
         }
 
-        gauge!("gpui_tea.queue.depth", base_labels.clone()).set(metadata.queue_depth as f64);
+        let active_subscriptions = match event {
+            TelemetryEvent::SubscriptionsReconciled { active, .. } => Some(active),
+            _ => None,
+        };
+        let unmounted = matches!(event, TelemetryEvent::ProgramUnmounted);
+        self.update_gauges(
+            metadata.program_id,
+            &base_labels,
+            (!unmounted).then_some(metadata.queue_depth),
+            active_subscriptions,
+        );
 
         match event {
             TelemetryEvent::DispatchAccepted { .. } => {
@@ -504,17 +562,74 @@ impl MetricsAdapter {
             TelemetryEvent::SubscriptionRemoved { .. } => {
                 counter!("gpui_tea.subscription.removed", base_labels).increment(1);
             }
-            TelemetryEvent::SubscriptionsReconciled { active, .. } => {
-                gauge!("gpui_tea.subscription.active", base_labels).set(active as f64);
-            }
             TelemetryEvent::QueueWarning { .. } => {
                 counter!("gpui_tea.queue.warning", base_labels).increment(1);
+            }
+            TelemetryEvent::ProgramUnmounted => {
+                counter!("gpui_tea.program.unmounted", base_labels).increment(1);
             }
             TelemetryEvent::QueueDrainStarted { .. }
             | TelemetryEvent::MessageProcessed { .. }
             | TelemetryEvent::SubscriptionRetained { .. }
+            | TelemetryEvent::SubscriptionsReconciled { .. }
             | TelemetryEvent::QueueDrainFinished { .. } => {}
         }
+    }
+
+    /// Apply this program's gauge changes as deltas so programs sharing labels add up.
+    ///
+    /// `None` values reset the program's contribution to zero; an unmount passes `None` for both.
+    fn update_gauges(
+        &self,
+        program_id: ProgramId,
+        labels: &[metrics::Label],
+        queue_depth: Option<usize>,
+        active_subscriptions: Option<usize>,
+    ) {
+        let mut gauges = self.gauges.lock().unwrap_or_else(PoisonError::into_inner);
+        let previous = gauges.get(&program_id).copied().unwrap_or_default();
+        let next = match (queue_depth, active_subscriptions) {
+            (None, None) => ProgramGauges::default(),
+            _ => ProgramGauges {
+                queue_depth: queue_depth.unwrap_or(previous.queue_depth),
+                active_subscriptions: active_subscriptions.unwrap_or(previous.active_subscriptions),
+            },
+        };
+
+        adjust_gauge(
+            "gpui_tea.queue.depth",
+            labels,
+            previous.queue_depth,
+            next.queue_depth,
+        );
+        adjust_gauge(
+            "gpui_tea.subscription.active",
+            labels,
+            previous.active_subscriptions,
+            next.active_subscriptions,
+        );
+
+        if next.queue_depth == 0 && next.active_subscriptions == 0 {
+            gauges.remove(&program_id);
+        } else {
+            gauges.insert(program_id, next);
+        }
+    }
+}
+
+#[cfg(feature = "metrics")]
+#[allow(clippy::cast_precision_loss)]
+fn adjust_gauge(name: &'static str, labels: &[metrics::Label], previous: usize, next: usize) {
+    use std::cmp::Ordering;
+
+    match next.cmp(&previous) {
+        Ordering::Greater => {
+            metrics::gauge!(name, labels.to_vec()).increment((next - previous) as f64);
+        }
+        Ordering::Less => {
+            metrics::gauge!(name, labels.to_vec()).decrement((previous - next) as f64);
+        }
+        Ordering::Equal => {}
     }
 }
 
@@ -529,8 +644,12 @@ impl MetricsAdapter {
 ///
 /// For custom configuration (such as enabling `"program_id"` or specifying a static program name),
 /// use [`MetricsAdapter`].
+///
+/// All calls share one process-wide default adapter, so gauge contributions of different
+/// programs add up as described in [`MetricsAdapter`].
 pub fn observe_metrics_telemetry<Msg>(envelope: TelemetryEnvelope<'_, Msg>) {
-    MetricsAdapter::default().observe(envelope);
+    static DEFAULT_ADAPTER: LazyLock<MetricsAdapter> = LazyLock::new(MetricsAdapter::default);
+    DEFAULT_ADAPTER.observe(envelope);
 }
 
 #[cfg(feature = "tracing")]
@@ -815,7 +934,7 @@ mod metrics_tests {
                     program_description: None,
                     event_id: 1,
                     emitted_at: std::time::SystemTime::now(),
-                    queue_depth: 0,
+                    queue_depth: 1,
                 },
                 event: TelemetryEvent::DispatchAccepted {
                     message_description: None,
@@ -827,6 +946,122 @@ mod metrics_tests {
         assert_eq!(seen.len(), 2); // queue.depth and dispatch.accepted
         assert!(seen.iter().all(|key| !has_any_label(key, "program")));
         assert!(seen.iter().all(|key| !has_any_label(key, "program_id")));
+    }
+
+    /// Track gauge values so tests can check what a scrape would report.
+    #[derive(Debug, Default)]
+    struct GaugeValues {
+        values: Arc<Mutex<HashMap<String, f64>>>,
+    }
+
+    struct GaugeValue {
+        name: String,
+        values: Arc<Mutex<HashMap<String, f64>>>,
+    }
+
+    impl GaugeFn for GaugeValue {
+        fn increment(&self, value: f64) {
+            *self
+                .values
+                .lock()
+                .unwrap()
+                .entry(self.name.clone())
+                .or_default() += value;
+        }
+
+        fn decrement(&self, value: f64) {
+            self.increment(-value);
+        }
+
+        fn set(&self, value: f64) {
+            self.values.lock().unwrap().insert(self.name.clone(), value);
+        }
+    }
+
+    impl Recorder for GaugeValues {
+        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+        fn register_counter(&self, _key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            Counter::noop()
+        }
+
+        fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            Gauge::from_arc(Arc::new(GaugeValue {
+                name: key.name().to_owned(),
+                values: self.values.clone(),
+            }))
+        }
+
+        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    fn envelope(
+        program_id: u64,
+        queue_depth: usize,
+        event: TelemetryEvent<'static, ()>,
+    ) -> TelemetryEnvelope<'static, ()> {
+        TelemetryEnvelope {
+            metadata: TelemetryMetadata {
+                program_id: ProgramId::from_raw(program_id),
+                program_description: Some(Arc::from("shared")),
+                event_id: 1,
+                emitted_at: std::time::SystemTime::now(),
+                queue_depth,
+            },
+            event,
+        }
+    }
+
+    #[test]
+    fn metrics_adapter_sums_gauges_of_programs_sharing_labels() {
+        let recorder = GaugeValues::default();
+        let values = recorder.values.clone();
+        let adapter = MetricsAdapter::new();
+        let gauge = |name: &str| values.lock().unwrap().get(name).copied().unwrap_or(0.0);
+
+        metrics::with_local_recorder(&recorder, || {
+            adapter.observe(envelope(
+                1,
+                3,
+                TelemetryEvent::SubscriptionsReconciled {
+                    active: 2,
+                    added: 2,
+                    removed: 0,
+                    retained: 0,
+                },
+            ));
+            adapter.observe(envelope(
+                2,
+                5,
+                TelemetryEvent::SubscriptionsReconciled {
+                    active: 1,
+                    added: 1,
+                    removed: 0,
+                    retained: 0,
+                },
+            ));
+        });
+        assert!((gauge("gpui_tea.queue.depth") - 8.0).abs() < f64::EPSILON);
+        assert!((gauge("gpui_tea.subscription.active") - 3.0).abs() < f64::EPSILON);
+
+        metrics::with_local_recorder(&recorder, || {
+            adapter.observe(envelope(
+                1,
+                0,
+                TelemetryEvent::DispatchAccepted {
+                    message_description: None,
+                },
+            ));
+            adapter.observe(envelope(2, 0, TelemetryEvent::ProgramUnmounted));
+        });
+        assert!(gauge("gpui_tea.queue.depth").abs() < f64::EPSILON);
+        assert!((gauge("gpui_tea.subscription.active") - 2.0).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -14,16 +14,17 @@ use syn::{
 pub(crate) fn parse_composite(input: DeriveInput) -> Result<CompositeSpec> {
     let DeriveInput {
         attrs,
+        vis,
         ident,
         generics,
         data,
-        ..
     } = input;
 
     let message_ty = parse_message_type(&attrs, composite_derive_span(&attrs))?;
     let children = parse_children(named_fields(data, &ident)?)?;
 
     Ok(CompositeSpec {
+        struct_vis: vis,
         struct_ident: ident,
         generics,
         message_ty,

@@ -15,8 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `RuntimeEvent::QueueOverflow` so runtime observers can see queue backpressure without
   enabling the telemetry pipeline.
-- Add RAII drain/auto-drain guards so a panic in `Model::update` no longer freezes the message
-  queue.
 - Allow `DropOldest` with `capacity: 0` to accept a message when there is nothing to displace.
 - Add `MetricsAdapterConfig` and `MetricsAdapter` builder to customize metric label emissions,
   supporting stable `"program"` labels from `program_name` or `program_description` and keeping
@@ -33,14 +31,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guarantees, and effect / subscription cancellations on program drop.
 - Add release workflow checks validating git tag version against `Cargo.toml` and ensuring macro
   dependencies are published to crates.io before `gpui_tea`.
+- Add `ProgramConfig::drain_budget` (default `1024`): a drain that exhausts its budget reconciles
+  subscriptions, notifies the view, and continues on the next executor turn, so long `emit`
+  chains no longer block rendering or starve external dispatches.
+- Add `RuntimeEvent::ProgramUnmounted` and `TelemetryEvent::ProgramUnmounted`, emitted when a
+  program is dropped, plus the `gpui_tea.program.unmounted` metrics counter.
 
 ### Changed
 
+- **Breaking:** depend on GPUI from Zed's Git repository (default branch) instead of `gpui` 0.2.2
+  from crates.io, and raise the minimum supported Rust version to 1.98 to match Zed's toolchain.
+  Applications must declare `gpui = { git = "https://github.com/zed-industries/zed" }` so both
+  crates share one GPUI build. Examples start through `gpui_platform::application()`.
 - Stop enabling `gpui`'s `test-support` feature for downstream consumers; it is now a
   dev-dependency only.
 - Move `tracing-subscriber` out of the `tracing` feature so library consumers no longer compile
   it; examples and tests still use it via dev-dependencies.
-- Mark `CommandKind` as `#[non_exhaustive]` to leave room for future command kinds.
+- **Breaking:** mark `CommandKind`, `RuntimeEvent`, `TelemetryEvent`, `QueuePolicy`,
+  `QueueOverflowAction`, `SubHandle`, `RuntimeSnapshot`, and `TelemetryMetadata` as
+  `#[non_exhaustive]` so future variants and fields are not breaking changes. Together with the
+  new event variants and the `MetricsAdapter` change below, the next release must be `0.2.0`.
+- **Breaking:** `MetricsAdapter` no longer implements `PartialEq`/`Eq`; it now carries shared
+  gauge bookkeeping. Compare `MetricsAdapter::config()` instead.
+- `RuntimeSnapshot::queue_depth`, `TelemetryMetadata::queue_depth`, and queue warnings now share
+  one definition: accepted external and internal messages that have not been processed yet.
+- Deliver externally dispatched messages in batches: one drain, one subscription reconciliation,
+  and one view notification per wake-up instead of per message.
+- `Composite` helpers now share the struct's visibility so the `Model` implementation can live in
+  another module, and generated code reaches GPUI through `gpui_tea` instead of `::gpui`.
+- Document that panics in `Model` callbacks are fatal: GPUI leaves the panicking program entity
+  permanently leased.
 - Document retain-by-key subscription semantics: retained keys keep the previously built resource
   and do not re-run the builder.
 - Reject empty `#[child(path = "...")]` values in the `Composite` derive.
@@ -60,6 +80,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fix `QueuePolicy::DropOldest` overflow telemetry to describe the displaced/dropped old message
   rather than the newly accepted message.
 - Fix `Command::cancel_key` to preserve command labels and emit `TelemetryEvent::CommandScheduled`.
+- Fix `QueuePolicy::DropOldest` keeping displaced messages alive in an unbounded channel; displaced
+  messages are now released as soon as they are displaced.
+- Fix queue warnings ignoring the external dispatch backlog; they are now emitted by the
+  dispatching side as soon as the queue depth exceeds the threshold.
+- Fix `MetricsAdapter` gauges overwriting each other when several programs share a label set;
+  `gpui_tea.queue.depth` and `gpui_tea.subscription.active` now report the sum over those programs.
+- Release messages still waiting in the queue when a program is dropped instead of keeping them
+  alive for as long as a `Dispatcher` clone exists.
 
 ## [0.1.1] - 2026-03-24
 

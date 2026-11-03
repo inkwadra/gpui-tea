@@ -215,12 +215,14 @@ fn elevated_shadow() -> Vec<BoxShadow> {
             offset: point(px(0.0), px(10.0)),
             blur_radius: px(28.0),
             spread_radius: px(-12.0),
+            inset: false,
         },
         BoxShadow {
             color: black().opacity(0.3),
             offset: point(px(0.0), px(1.0)),
             blur_radius: px(2.0),
             spread_radius: px(0.0),
+            inset: false,
         },
     ]
 }

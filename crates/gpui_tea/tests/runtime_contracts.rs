@@ -4014,6 +4014,10 @@ fn metrics_adapter_integration_with_mounted_program_verifies_cardinality_safety(
 
         dispatcher.dispatch(Msg::Ping).unwrap();
         cx.run_until_parked();
+
+        // Release the program while this step's recorder is installed.
+        drop(program);
+        cx.update(|_cx| {});
     });
 
     {
@@ -4047,6 +4051,10 @@ fn metrics_adapter_integration_with_mounted_program_verifies_cardinality_safety(
 
         dispatcher.dispatch(Msg::Ping).unwrap();
         cx.run_until_parked();
+
+        // Release the program while this step's recorder is installed.
+        drop(program);
+        cx.update(|_cx| {});
     });
 
     {
@@ -4076,6 +4084,10 @@ fn metrics_adapter_integration_with_mounted_program_verifies_cardinality_safety(
 
         dispatcher.dispatch(Msg::Ping).unwrap();
         cx.run_until_parked();
+
+        // Release the program while this step's recorder is installed.
+        drop(program);
+        cx.update(|_cx| {});
     });
 
     {
@@ -4106,6 +4118,10 @@ fn metrics_adapter_integration_with_mounted_program_verifies_cardinality_safety(
 
         dispatcher.dispatch(Msg::Ping).unwrap();
         cx.run_until_parked();
+
+        // Release the program while this step's recorder is installed.
+        drop(program);
+        cx.update(|_cx| {});
     });
 
     {
@@ -4120,4 +4136,293 @@ fn metrics_adapter_integration_with_mounted_program_verifies_cardinality_safety(
             "observe_metrics_telemetry must include stable program label"
         );
     }
+}
+
+#[derive(Debug)]
+enum BurstMsg {
+    Tick,
+}
+
+struct BurstModel {
+    processed: usize,
+    subscription_calls: Arc<AtomicUsize>,
+}
+
+impl Model for BurstModel {
+    type Msg = BurstMsg;
+
+    fn update(
+        &mut self,
+        _msg: Self::Msg,
+        _cx: &mut App,
+        _scope: &ModelContext<Self::Msg>,
+    ) -> Command<Self::Msg> {
+        self.processed += 1;
+        Command::none()
+    }
+
+    fn view(
+        &self,
+        _window: &mut Window,
+        _cx: &mut App,
+        _scope: &ModelContext<Self::Msg>,
+        _dispatcher: &Dispatcher<Self::Msg>,
+    ) -> View {
+        div().into_view()
+    }
+
+    fn subscriptions(
+        &self,
+        _cx: &mut App,
+        _scope: &ModelContext<Self::Msg>,
+    ) -> Subscriptions<Self::Msg> {
+        self.subscription_calls.fetch_add(1, Ordering::SeqCst);
+        Subscriptions::one(Subscription::new("burst", |_| SubHandle::None))
+    }
+}
+
+#[gpui::test]
+fn external_burst_is_drained_once_with_a_single_reconciliation(cx: &mut TestAppContext) {
+    let drains = Arc::new(Mutex::new(Vec::new()));
+    let subscription_calls = Arc::new(AtomicUsize::new(0));
+    let config = ProgramConfig::default().observer({
+        let drains = drains.clone();
+        move |event: RuntimeEvent<'_, BurstMsg>| {
+            if let RuntimeEvent::QueueDrainStarted { queued } = event {
+                drains.lock().unwrap().push(queued);
+            }
+        }
+    });
+    let program = cx.update(|cx| {
+        BurstModel {
+            processed: 0,
+            subscription_calls: subscription_calls.clone(),
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+    let calls_after_mount = subscription_calls.load(Ordering::SeqCst);
+
+    for _ in 0..100 {
+        dispatcher.dispatch(BurstMsg::Tick).unwrap();
+    }
+    cx.run_until_parked();
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().processed, 100);
+        assert_eq!(program.runtime_snapshot().queue_depth, 0);
+    });
+    assert_eq!(drains.lock().unwrap().as_slice(), &[100]);
+    assert_eq!(
+        subscription_calls.load(Ordering::SeqCst) - calls_after_mount,
+        1
+    );
+}
+
+#[gpui::test]
+fn queue_warning_and_snapshot_report_the_external_backlog(cx: &mut TestAppContext) {
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let config = ProgramConfig::default()
+        .queue_warning_threshold(2)
+        .telemetry_observer({
+            let warnings = warnings.clone();
+            move |envelope: TelemetryEnvelope<'_, BurstMsg>| {
+                if let TelemetryEvent::QueueWarning { queued, .. } = envelope.event {
+                    warnings
+                        .lock()
+                        .unwrap()
+                        .push((queued, envelope.metadata.queue_depth));
+                }
+            }
+        });
+    let program = cx.update(|cx| {
+        BurstModel {
+            processed: 0,
+            subscription_calls: Arc::new(AtomicUsize::new(0)),
+        }
+        .into_program_with(config, cx)
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    for _ in 0..5 {
+        dispatcher.dispatch(BurstMsg::Tick).unwrap();
+    }
+    let backlog = program.read_with(cx, |program, _cx| program.runtime_snapshot().queue_depth);
+    cx.run_until_parked();
+
+    assert_eq!(backlog, 5);
+    assert_eq!(
+        warnings.lock().unwrap().as_slice(),
+        &[(3, 3), (4, 4), (5, 5)]
+    );
+}
+
+struct TrackedMsg(Arc<AtomicUsize>);
+
+impl TrackedMsg {
+    fn new(live: &Arc<AtomicUsize>) -> Self {
+        live.fetch_add(1, Ordering::SeqCst);
+        Self(live.clone())
+    }
+}
+
+impl Drop for TrackedMsg {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct TrackedModel {
+    processed: usize,
+}
+
+impl Model for TrackedModel {
+    type Msg = TrackedMsg;
+
+    fn update(
+        &mut self,
+        _msg: Self::Msg,
+        _cx: &mut App,
+        _scope: &ModelContext<Self::Msg>,
+    ) -> Command<Self::Msg> {
+        self.processed += 1;
+        Command::none()
+    }
+
+    fn view(
+        &self,
+        _window: &mut Window,
+        _cx: &mut App,
+        _scope: &ModelContext<Self::Msg>,
+        _dispatcher: &Dispatcher<Self::Msg>,
+    ) -> View {
+        div().into_view()
+    }
+}
+
+#[gpui::test]
+fn drop_oldest_releases_displaced_messages_immediately(cx: &mut TestAppContext) {
+    let live = Arc::new(AtomicUsize::new(0));
+    let program = cx.update(|cx| {
+        TrackedModel { processed: 0 }.into_program_with(
+            ProgramConfig::default().queue_policy(QueuePolicy::DropOldest { capacity: 2 }),
+            cx,
+        )
+    });
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    for _ in 0..1000 {
+        dispatcher.dispatch(TrackedMsg::new(&live)).unwrap();
+    }
+    assert_eq!(live.load(Ordering::SeqCst), 2);
+
+    cx.run_until_parked();
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().processed, 2);
+    });
+}
+
+#[gpui::test]
+fn dropping_the_program_rejects_dispatches_and_releases_queued_messages(cx: &mut TestAppContext) {
+    let live = Arc::new(AtomicUsize::new(0));
+    let unmounted = Arc::new(AtomicUsize::new(0));
+    let config = ProgramConfig::default().telemetry_observer({
+        let unmounted = unmounted.clone();
+        move |envelope: TelemetryEnvelope<'_, TrackedMsg>| {
+            if matches!(envelope.event, TelemetryEvent::ProgramUnmounted) {
+                unmounted.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    let program = cx.update(|cx| TrackedModel { processed: 0 }.into_program_with(config, cx));
+    let dispatcher = program.read_with(cx, |program, _cx| program.dispatcher());
+
+    dispatcher.dispatch(TrackedMsg::new(&live)).unwrap();
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+
+    drop(program);
+    cx.update(|_cx| {});
+
+    assert_eq!(unmounted.load(Ordering::SeqCst), 1);
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        dispatcher.dispatch(TrackedMsg::new(&live)),
+        Err(gpui_tea::Error::ProgramUnavailable)
+    );
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+}
+
+#[derive(Debug)]
+enum ChainMsg {
+    Step(usize),
+}
+
+struct ChainModel {
+    steps: Vec<usize>,
+}
+
+impl Model for ChainModel {
+    type Msg = ChainMsg;
+
+    fn init(&mut self, _cx: &mut App, _scope: &ModelContext<Self::Msg>) -> Command<Self::Msg> {
+        Command::emit(ChainMsg::Step(1))
+    }
+
+    fn update(
+        &mut self,
+        msg: Self::Msg,
+        _cx: &mut App,
+        _scope: &ModelContext<Self::Msg>,
+    ) -> Command<Self::Msg> {
+        let ChainMsg::Step(step) = msg;
+        self.steps.push(step);
+        if step < 5 {
+            Command::emit(ChainMsg::Step(step + 1))
+        } else {
+            Command::none()
+        }
+    }
+
+    fn view(
+        &self,
+        _window: &mut Window,
+        _cx: &mut App,
+        _scope: &ModelContext<Self::Msg>,
+        _dispatcher: &Dispatcher<Self::Msg>,
+    ) -> View {
+        div().into_view()
+    }
+}
+
+#[gpui::test]
+fn drain_budget_yields_between_chunks_and_preserves_order(cx: &mut TestAppContext) {
+    let finished = Arc::new(Mutex::new(Vec::new()));
+    let config = ProgramConfig::default().drain_budget(2).observer({
+        let finished = finished.clone();
+        move |event: RuntimeEvent<'_, ChainMsg>| {
+            if let RuntimeEvent::QueueDrainFinished {
+                processed,
+                remaining,
+            } = event
+            {
+                finished.lock().unwrap().push((processed, remaining));
+            }
+        }
+    });
+    let program = cx.update(|cx| ChainModel { steps: Vec::new() }.into_program_with(config, cx));
+
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().steps, vec![1, 2]);
+    });
+
+    cx.run_until_parked();
+    program.read_with(cx, |program, _cx| {
+        assert_eq!(program.model().steps, vec![1, 2, 3, 4, 5]);
+        assert_eq!(program.runtime_snapshot().queue_depth, 0);
+    });
+    assert_eq!(
+        finished.lock().unwrap().as_slice(),
+        &[(2, 1), (2, 1), (1, 0)]
+    );
 }

@@ -1,10 +1,11 @@
-use crate::observability::{QueueOverflowAction, QueuePolicy};
+use crate::observability::QueuePolicy;
 use std::{
     collections::{HashSet, VecDeque},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    task::{Context, Poll, Waker},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -102,35 +103,63 @@ impl Drop for DrainGuard {
     }
 }
 
-/// Internal reservation state for a queue.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum QueueReservation {
+/// A batch of external messages handed from the inbox to the program, in dispatch order.
+pub(crate) type InboxBatch<Msg> = VecDeque<(QueueEntryId, Msg)>;
+
+/// Result of offering an externally dispatched message to the queue.
+pub(crate) enum EnqueueOutcome<Msg> {
+    /// The message was accepted.
     Accepted {
-        id: QueueEntryId,
-        overflow_action: Option<QueueOverflowAction>,
-        displaced: Option<QueueEntryId>,
-        dropped_message_description: Option<Arc<str>>,
+        /// Total queue depth after the message was accepted.
+        depth: usize,
+        /// The oldest message displaced under [`QueuePolicy::DropOldest`], if any.
+        displaced: Option<Displaced<Msg>>,
     },
-    Rejected,
-    DroppedNewest,
+    /// The policy rejected the message; it is handed back to the caller.
+    Rejected(Msg),
+    /// The policy dropped the message; it is handed back to the caller.
+    DroppedNewest(Msg),
+    /// The program is gone; the message is handed back to the caller.
+    Closed(Msg),
+}
+
+/// A message displaced by [`QueuePolicy::DropOldest`].
+pub(crate) struct Displaced<Msg> {
+    pub(crate) description: Option<Arc<str>>,
+    /// The displaced message when it was still waiting in the inbox. It is `None` when the
+    /// program already took it, in which case the drain loop skips it.
+    pub(crate) message: Option<Msg>,
 }
 
 /// Internal control state for a queue.
-#[derive(Debug)]
-struct QueueControl {
+struct QueueControl<Msg> {
     policy: QueuePolicy,
     next_id: u64,
+    /// External messages accepted but not processed yet, in dispatch order.
     active: VecDeque<(QueueEntryId, Option<Arc<str>>)>,
+    /// External messages that have not been handed to the program yet.
+    ///
+    /// The program takes the whole inbox at once, so the inbox is always the newest suffix of
+    /// `active`.
+    inbox: InboxBatch<Msg>,
+    /// Messages displaced after the program already took them out of the inbox.
     dropped: HashSet<QueueEntryId>,
+    internal_pending: usize,
+    closed: bool,
+    waker: Option<Waker>,
 }
 
-impl QueueControl {
+impl<Msg> QueueControl<Msg> {
     fn new(policy: QueuePolicy) -> Self {
         Self {
             policy,
             next_id: 0,
             active: VecDeque::new(),
+            inbox: VecDeque::new(),
             dropped: HashSet::new(),
+            internal_pending: 0,
+            closed: false,
+            waker: None,
         }
     }
 
@@ -139,183 +168,293 @@ impl QueueControl {
         QueueEntryId(self.next_id)
     }
 
-    fn reserve_enqueue(&mut self, description: Option<Arc<str>>) -> QueueReservation {
-        let Some(capacity) = self.policy.capacity() else {
-            let id = self.next_id();
-            self.active.push_back((id, description));
-            return QueueReservation::Accepted {
-                id,
-                overflow_action: None,
-                displaced: None,
-                dropped_message_description: None,
-            };
-        };
-
-        if self.active.len() < capacity {
-            let id = self.next_id();
-            self.active.push_back((id, description));
-            return QueueReservation::Accepted {
-                id,
-                overflow_action: None,
-                displaced: None,
-                dropped_message_description: None,
-            };
-        }
-
-        match self.policy {
-            QueuePolicy::Unbounded => {
-                let id = self.next_id();
-                self.active.push_back((id, description));
-                QueueReservation::Accepted {
-                    id,
-                    overflow_action: None,
-                    displaced: None,
-                    dropped_message_description: None,
-                }
-            }
-            QueuePolicy::RejectNew { .. } => QueueReservation::Rejected,
-            QueuePolicy::DropNewest { .. } => QueueReservation::DroppedNewest,
-            QueuePolicy::DropOldest { .. } => {
-                // capacity == 0 (or a temporarily empty queue at capacity) still accepts by
-                // displacing the oldest entry when one exists; with nothing to displace the
-                // newest message is kept so DropOldest never silently drops everything.
-                let Some((oldest, oldest_description)) = self.active.pop_front() else {
-                    let id = self.next_id();
-                    self.active.push_back((id, description));
-                    return QueueReservation::Accepted {
-                        id,
-                        overflow_action: None,
-                        displaced: None,
-                        dropped_message_description: None,
-                    };
-                };
-                self.dropped.insert(oldest);
-                let id = self.next_id();
-                self.active.push_back((id, description));
-                QueueReservation::Accepted {
-                    id,
-                    overflow_action: Some(QueueOverflowAction::DroppedOldest),
-                    displaced: Some(oldest),
-                    dropped_message_description: oldest_description,
-                }
-            }
-        }
-    }
-
-    fn rollback_enqueue(&mut self, reservation: &QueueReservation) {
-        let QueueReservation::Accepted {
-            id,
-            overflow_action,
-            displaced,
-            dropped_message_description,
-        } = reservation
-        else {
-            return;
-        };
-
-        if let Some(position) = self.active.iter().position(|(entry, _)| entry == id) {
-            self.active.remove(position);
-        }
-
-        if *overflow_action == Some(QueueOverflowAction::DroppedOldest)
-            && let Some(displaced) = displaced
-            && self.dropped.remove(displaced)
-        {
-            self.active
-                .push_front((*displaced, dropped_message_description.clone()));
-        }
-    }
-
-    fn complete_processed(&mut self, id: QueueEntryId) {
-        if let Some(position) = self.active.iter().position(|(entry, _)| *entry == id) {
-            self.active.remove(position);
-        }
-    }
-
-    fn take_if_dropped(&mut self, id: QueueEntryId) -> bool {
-        self.dropped.remove(&id)
-    }
-
     fn depth(&self) -> usize {
-        self.active.len()
+        self.active.len() + self.internal_pending
+    }
+
+    fn offer(&mut self, message: Msg, description: Option<Arc<str>>) -> EnqueueOutcome<Msg> {
+        if self.closed {
+            return EnqueueOutcome::Closed(message);
+        }
+
+        let displaced = match self.policy.capacity() {
+            Some(capacity) if self.active.len() >= capacity => match self.policy {
+                QueuePolicy::RejectNew { .. } => return EnqueueOutcome::Rejected(message),
+                QueuePolicy::DropNewest { .. } => return EnqueueOutcome::DroppedNewest(message),
+                // With nothing to displace (capacity 0 on an empty queue) the new message is
+                // kept so DropOldest never silently drops everything.
+                QueuePolicy::DropOldest { .. } => self.displace_oldest(),
+                QueuePolicy::Unbounded => None,
+            },
+            _ => None,
+        };
+
+        let id = self.next_id();
+        self.active.push_back((id, description));
+        self.inbox.push_back((id, message));
+        EnqueueOutcome::Accepted {
+            depth: self.depth(),
+            displaced,
+        }
+    }
+
+    fn displace_oldest(&mut self) -> Option<Displaced<Msg>> {
+        let (oldest, description) = self.active.pop_front()?;
+        let message = if self.inbox.front().is_some_and(|(id, _)| *id == oldest) {
+            self.inbox.pop_front().map(|(_, message)| message)
+        } else {
+            self.dropped.insert(oldest);
+            None
+        };
+
+        Some(Displaced {
+            description,
+            message,
+        })
+    }
+
+    fn begin_processing(&mut self, id: QueueEntryId) -> bool {
+        if self.dropped.remove(&id) {
+            return false;
+        }
+
+        if self.active.front().is_some_and(|(entry, _)| *entry == id) {
+            self.active.pop_front();
+        } else if let Some(position) = self.active.iter().position(|(entry, _)| *entry == id) {
+            self.active.remove(position);
+        }
+        true
     }
 }
 
-/// Internal tracker for a queue.
-#[derive(Debug)]
-pub(crate) struct QueueTracker {
-    control: Mutex<QueueControl>,
+/// Shared queue state between dispatchers and the mounted program.
+///
+/// External messages wait in an inbox guarded by the same lock as the queue policy, so a
+/// displaced message is released as soon as it is displaced instead of lingering in a channel.
+pub(crate) struct QueueTracker<Msg> {
+    control: Mutex<QueueControl<Msg>>,
 }
 
-impl QueueTracker {
+impl<Msg> QueueTracker<Msg> {
     pub(crate) fn new(policy: QueuePolicy) -> Self {
         Self {
             control: Mutex::new(QueueControl::new(policy)),
         }
     }
 
-    pub(crate) fn reserve_enqueue(&self, description: Option<Arc<str>>) -> QueueReservation {
-        self.control.lock().unwrap().reserve_enqueue(description)
+    fn lock(&self) -> MutexGuard<'_, QueueControl<Msg>> {
+        // Critical sections never run user code, so a poisoned lock still holds valid state.
+        self.control.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn rollback_enqueue(&self, reservation: &QueueReservation) {
-        self.control.lock().unwrap().rollback_enqueue(reservation);
+    /// Offer an externally dispatched message and wake the program when it is accepted.
+    pub(crate) fn offer(&self, message: Msg, description: Option<Arc<str>>) -> EnqueueOutcome<Msg> {
+        let (outcome, waker) = {
+            let mut control = self.lock();
+            let outcome = control.offer(message, description);
+            let waker = match outcome {
+                EnqueueOutcome::Accepted { .. } => control.waker.take(),
+                _ => None,
+            };
+            (outcome, waker)
+        };
+
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        outcome
     }
 
-    pub(crate) fn complete_processed(&self, id: QueueEntryId) {
-        self.control.lock().unwrap().complete_processed(id);
+    /// Take every message waiting in the inbox, or register `cx` to be woken by the next one.
+    ///
+    /// Resolves to `None` once the queue is closed and the inbox is empty.
+    pub(crate) fn poll_take(&self, cx: &mut Context<'_>) -> Poll<Option<InboxBatch<Msg>>> {
+        let mut control = self.lock();
+        if !control.inbox.is_empty() {
+            return Poll::Ready(Some(std::mem::take(&mut control.inbox)));
+        }
+        if control.closed {
+            return Poll::Ready(None);
+        }
+
+        match &mut control.waker {
+            Some(waker) if waker.will_wake(cx.waker()) => {}
+            slot => *slot = Some(cx.waker().clone()),
+        }
+        Poll::Pending
     }
 
-    pub(crate) fn take_if_dropped(&self, id: QueueEntryId) -> bool {
-        self.control.lock().unwrap().take_if_dropped(id)
+    /// Reject further dispatches and release every message still waiting in the inbox.
+    pub(crate) fn close(&self) {
+        let (inbox, waker) = {
+            let mut control = self.lock();
+            control.closed = true;
+            control.active.clear();
+            control.dropped.clear();
+            control.internal_pending = 0;
+            (std::mem::take(&mut control.inbox), control.waker.take())
+        };
+        drop(inbox);
+        drop(waker);
     }
 
+    /// Mark an external message as being processed.
+    ///
+    /// Returns `false` when the message was displaced after the program took it, in which case
+    /// it must be skipped.
+    pub(crate) fn begin_processing(&self, id: QueueEntryId) -> bool {
+        self.lock().begin_processing(id)
+    }
+
+    /// Record an internal message entering the pending queue and return the new total depth.
+    pub(crate) fn internal_enqueued(&self) -> usize {
+        let mut control = self.lock();
+        control.internal_pending += 1;
+        control.depth()
+    }
+
+    /// Record an internal message leaving the pending queue.
+    pub(crate) fn internal_dequeued(&self) {
+        let mut control = self.lock();
+        control.internal_pending = control.internal_pending.saturating_sub(1);
+    }
+
+    /// Return the number of accepted messages that have not been processed yet, external and
+    /// internal combined.
     pub(crate) fn depth(&self) -> usize {
-        self.control.lock().unwrap().depth()
+        self.lock().depth()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observability::QueuePolicy;
+    use futures::task::{ArcWake, waker};
+
+    struct WakeFlag(AtomicBool);
+
+    impl ArcWake for WakeFlag {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn accepted<Msg>(outcome: EnqueueOutcome<Msg>) -> (usize, Option<Displaced<Msg>>) {
+        match outcome {
+            EnqueueOutcome::Accepted { depth, displaced } => (depth, displaced),
+            _ => panic!("message must be accepted"),
+        }
+    }
+
+    fn take_ready<Msg>(tracker: &QueueTracker<Msg>) -> Option<InboxBatch<Msg>> {
+        let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = waker(flag);
+        match tracker.poll_take(&mut Context::from_waker(&waker)) {
+            Poll::Ready(batch) => batch,
+            Poll::Pending => panic!("inbox must be ready"),
+        }
+    }
 
     #[test]
     fn drop_oldest_capacity_zero_accepts_when_nothing_to_displace() {
         let tracker = QueueTracker::new(QueuePolicy::DropOldest { capacity: 0 });
-        let reservation = tracker.reserve_enqueue(None);
-        assert!(matches!(
-            reservation,
-            QueueReservation::Accepted {
-                overflow_action: None,
-                displaced: None,
-                dropped_message_description: None,
-                ..
-            }
-        ));
+        let (depth, displaced) = accepted(tracker.offer(1, None));
+        assert!(displaced.is_none());
+        assert_eq!(depth, 1);
+    }
+
+    #[test]
+    fn drop_oldest_releases_displaced_message_still_in_inbox() {
+        let tracker = QueueTracker::new(QueuePolicy::DropOldest { capacity: 1 });
+        accepted(tracker.offer("first", Some(Arc::from("first"))));
+        let (depth, displaced) = accepted(tracker.offer("second", Some(Arc::from("second"))));
+
+        let displaced = displaced.expect("first message must be displaced");
+        assert_eq!(displaced.description.as_deref(), Some("first"));
+        assert_eq!(displaced.message, Some("first"));
+        assert_eq!(depth, 1);
+
+        let batch = take_ready(&tracker).expect("queue is open");
+        assert_eq!(
+            batch.into_iter().map(|(_, msg)| msg).collect::<Vec<_>>(),
+            vec!["second"]
+        );
+    }
+
+    #[test]
+    fn drop_oldest_marks_taken_message_as_dropped() {
+        let tracker = QueueTracker::new(QueuePolicy::DropOldest { capacity: 1 });
+        accepted(tracker.offer("first", None));
+        let batch = take_ready(&tracker).expect("queue is open");
+        let (first_id, _) = batch[0];
+
+        let (_, displaced) = accepted(tracker.offer("second", None));
+        let displaced = displaced.expect("first message must be displaced");
+        assert!(displaced.message.is_none());
+        assert!(!tracker.begin_processing(first_id));
         assert_eq!(tracker.depth(), 1);
     }
 
     #[test]
-    fn drop_oldest_capacity_zero_displaces_previous_entry() {
-        let tracker = QueueTracker::new(QueuePolicy::DropOldest { capacity: 0 });
-        let first = tracker.reserve_enqueue(Some(Arc::from("first")));
-        let second = tracker.reserve_enqueue(Some(Arc::from("second")));
+    fn reject_new_and_drop_newest_hand_the_message_back() {
+        let reject = QueueTracker::new(QueuePolicy::RejectNew { capacity: 1 });
+        accepted(reject.offer(1, None));
+        assert!(matches!(reject.offer(2, None), EnqueueOutcome::Rejected(2)));
+        assert_eq!(reject.depth(), 1);
 
-        let QueueReservation::Accepted { id: first_id, .. } = first else {
-            panic!("first reservation must be accepted");
+        let drop_newest = QueueTracker::new(QueuePolicy::DropNewest { capacity: 1 });
+        accepted(drop_newest.offer(1, None));
+        assert!(matches!(
+            drop_newest.offer(2, None),
+            EnqueueOutcome::DroppedNewest(2)
+        ));
+        assert_eq!(drop_newest.depth(), 1);
+    }
+
+    #[test]
+    fn poll_take_hands_over_the_whole_inbox_in_order_and_wakes_on_offer() {
+        let tracker = QueueTracker::new(QueuePolicy::Unbounded);
+        let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = waker(flag.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(tracker.poll_take(&mut cx).is_pending());
+        accepted(tracker.offer(1, None));
+        accepted(tracker.offer(2, None));
+        assert!(flag.0.load(Ordering::SeqCst));
+
+        let Poll::Ready(Some(batch)) = tracker.poll_take(&mut cx) else {
+            panic!("inbox must be ready");
         };
         assert_eq!(
-            second,
-            QueueReservation::Accepted {
-                id: QueueEntryId(2),
-                overflow_action: Some(QueueOverflowAction::DroppedOldest),
-                displaced: Some(first_id),
-                dropped_message_description: Some(Arc::from("first")),
-            }
+            batch.into_iter().map(|(_, msg)| msg).collect::<Vec<_>>(),
+            vec![1, 2]
         );
-        assert!(tracker.take_if_dropped(first_id));
+        assert_eq!(tracker.depth(), 2);
+    }
+
+    #[test]
+    fn close_rejects_new_messages_and_finishes_the_inbox_stream() {
+        let tracker = QueueTracker::new(QueuePolicy::Unbounded);
+        accepted(tracker.offer(1, None));
+        tracker.close();
+
+        assert!(matches!(tracker.offer(2, None), EnqueueOutcome::Closed(2)));
+        assert!(take_ready(&tracker).is_none());
+        assert_eq!(tracker.depth(), 0);
+    }
+
+    #[test]
+    fn depth_counts_external_and_internal_messages() {
+        let tracker = QueueTracker::new(QueuePolicy::Unbounded);
+        accepted(tracker.offer(1, None));
+        assert_eq!(tracker.internal_enqueued(), 2);
+
+        let batch = take_ready(&tracker).expect("queue is open");
+        assert!(tracker.begin_processing(batch[0].0));
         assert_eq!(tracker.depth(), 1);
+        tracker.internal_dequeued();
+        assert_eq!(tracker.depth(), 0);
     }
 
     #[test]
@@ -347,37 +486,6 @@ mod tests {
     }
 
     #[test]
-    fn drain_guard_preserves_remaining_messages_on_panic() {
-        let mut queue = MessageQueue::<i32>::default();
-        queue.pending.push_back(QueuedMessage {
-            origin: QueueOrigin::External(QueueEntryId(1)),
-            message: 1,
-        });
-        queue.pending.push_back(QueuedMessage {
-            origin: QueueOrigin::Internal,
-            message: 2,
-        });
-        queue.pending.push_back(QueuedMessage {
-            origin: QueueOrigin::External(QueueEntryId(3)),
-            message: 3,
-        });
-
-        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = DrainGuard::start(&queue);
-            let first = queue.pending.pop_front().unwrap();
-            assert_eq!(first.message, 1);
-            panic!("panic while processing first message");
-        }));
-        assert!(panic_result.is_err());
-
-        assert!(!queue.is_draining());
-        assert!(queue.should_auto_drain());
-        assert_eq!(queue.pending.len(), 2);
-        assert_eq!(queue.pending.pop_front().unwrap().message, 2);
-        assert_eq!(queue.pending.pop_front().unwrap().message, 3);
-    }
-
-    #[test]
     fn auto_drain_guard_restores_suspension_on_panic() {
         let queue = MessageQueue::<i32>::default();
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -387,205 +495,5 @@ mod tests {
         }));
         assert!(panic_result.is_err());
         assert!(queue.should_auto_drain());
-    }
-
-    #[test]
-    fn rollback_enqueue_without_displacement_removes_entry() {
-        let tracker = QueueTracker::new(QueuePolicy::Unbounded);
-        let res = tracker.reserve_enqueue(Some(Arc::from("first")));
-        assert_eq!(tracker.depth(), 1);
-        tracker.rollback_enqueue(&res);
-        assert_eq!(tracker.depth(), 0);
-    }
-
-    #[test]
-    fn rollback_enqueue_restores_displaced_oldest_entry() {
-        let tracker = QueueTracker::new(QueuePolicy::DropOldest { capacity: 1 });
-        let first = tracker.reserve_enqueue(Some(Arc::from("first")));
-        let second = tracker.reserve_enqueue(Some(Arc::from("second")));
-
-        let QueueReservation::Accepted { id: first_id, .. } = first else {
-            panic!("first must be accepted");
-        };
-        assert!(matches!(
-            second,
-            QueueReservation::Accepted {
-                overflow_action: Some(QueueOverflowAction::DroppedOldest),
-                displaced: Some(id),
-                ..
-            } if id == first_id
-        ));
-
-        // Rolling back the second reservation should restore the displaced first reservation.
-        tracker.rollback_enqueue(&second);
-        assert_eq!(tracker.depth(), 1);
-        // The first ID should no longer be marked as dropped:
-        assert!(!tracker.take_if_dropped(first_id));
-    }
-
-    #[test]
-    fn interleaved_internal_and_external_preserves_fifo_order_and_protects_internal() {
-        let tracker = QueueTracker::new(QueuePolicy::DropOldest { capacity: 1 });
-        let mut queue = MessageQueue::<&'static str>::default();
-
-        // 1. External message E1 arrives and is reserved
-        let res1 = tracker.reserve_enqueue(Some(Arc::from("e1")));
-        let QueueReservation::Accepted { id: id1, .. } = res1 else {
-            panic!("e1 must be accepted");
-        };
-        queue.pending.push_back(QueuedMessage {
-            origin: QueueOrigin::External(id1),
-            message: "e1",
-        });
-
-        // 2. Internal message I1 is queued directly into pending (guaranteed delivery)
-        queue.pending.push_back(QueuedMessage {
-            origin: QueueOrigin::Internal,
-            message: "i1",
-        });
-
-        // 3. External message E2 arrives; with capacity 1, it displaces E1 in tracker's active pool
-        let res2 = tracker.reserve_enqueue(Some(Arc::from("e2")));
-        let QueueReservation::Accepted {
-            id: id2,
-            overflow_action,
-            displaced,
-            ..
-        } = res2
-        else {
-            panic!("e2 must be accepted");
-        };
-        assert_eq!(overflow_action, Some(QueueOverflowAction::DroppedOldest));
-        assert_eq!(displaced, Some(id1));
-        queue.pending.push_back(QueuedMessage {
-            origin: QueueOrigin::External(id2),
-            message: "e2",
-        });
-
-        // 4. Internal message I2 is queued directly into pending
-        queue.pending.push_back(QueuedMessage {
-            origin: QueueOrigin::Internal,
-            message: "i2",
-        });
-
-        // Drain the pending queue and simulate program drain logic
-        let mut processed = Vec::new();
-        while let Some(queued) = queue.pending.pop_front() {
-            if let QueueOrigin::External(id) = queued.origin {
-                if tracker.take_if_dropped(id) {
-                    continue;
-                }
-                tracker.complete_processed(id);
-            }
-            processed.push(queued.message);
-        }
-
-        // E1 was displaced, I1 was kept, E2 was processed, I2 was kept. FIFO preserved!
-        assert_eq!(processed, vec!["i1", "e2", "i2"]);
-        assert_eq!(tracker.depth(), 0);
-    }
-
-    #[test]
-    fn reject_new_saturation_rejects_further_entries() {
-        let tracker = QueueTracker::new(QueuePolicy::RejectNew { capacity: 2 });
-        let first = tracker.reserve_enqueue(Some(Arc::from("first")));
-        assert!(matches!(first, QueueReservation::Accepted { .. }));
-        assert_eq!(tracker.depth(), 1);
-
-        let second = tracker.reserve_enqueue(Some(Arc::from("second")));
-        assert!(matches!(second, QueueReservation::Accepted { .. }));
-        assert_eq!(tracker.depth(), 2);
-
-        let third = tracker.reserve_enqueue(Some(Arc::from("third")));
-        assert_eq!(third, QueueReservation::Rejected);
-        assert_eq!(tracker.depth(), 2);
-    }
-
-    #[test]
-    fn drop_newest_saturation_drops_further_entries() {
-        let tracker = QueueTracker::new(QueuePolicy::DropNewest { capacity: 2 });
-        let first = tracker.reserve_enqueue(Some(Arc::from("first")));
-        assert!(matches!(first, QueueReservation::Accepted { .. }));
-        assert_eq!(tracker.depth(), 1);
-
-        let second = tracker.reserve_enqueue(Some(Arc::from("second")));
-        assert!(matches!(second, QueueReservation::Accepted { .. }));
-        assert_eq!(tracker.depth(), 2);
-
-        let third = tracker.reserve_enqueue(Some(Arc::from("third")));
-        assert_eq!(third, QueueReservation::DroppedNewest);
-        assert_eq!(tracker.depth(), 2);
-    }
-
-    #[test]
-    fn interleaved_internal_and_external_under_reject_new() {
-        let tracker = QueueTracker::new(QueuePolicy::RejectNew { capacity: 1 });
-        let mut queue = MessageQueue::<&'static str>::default();
-
-        let res1 = tracker.reserve_enqueue(Some(Arc::from("e1")));
-        let QueueReservation::Accepted { id: id1, .. } = res1 else {
-            panic!("e1 must be accepted");
-        };
-        queue.pending.push_back(QueuedMessage {
-            origin: QueueOrigin::External(id1),
-            message: "e1",
-        });
-
-        // External is saturated, new external is rejected
-        let res2 = tracker.reserve_enqueue(Some(Arc::from("e2")));
-        assert_eq!(res2, QueueReservation::Rejected);
-
-        // Internal message is enqueued directly (guaranteed delivery)
-        queue.pending.push_back(QueuedMessage {
-            origin: QueueOrigin::Internal,
-            message: "i1",
-        });
-
-        let mut processed = Vec::new();
-        while let Some(queued) = queue.pending.pop_front() {
-            if let QueueOrigin::External(id) = queued.origin {
-                tracker.complete_processed(id);
-            }
-            processed.push(queued.message);
-        }
-
-        assert_eq!(processed, vec!["e1", "i1"]);
-        assert_eq!(tracker.depth(), 0);
-    }
-
-    #[test]
-    fn interleaved_internal_and_external_under_drop_newest() {
-        let tracker = QueueTracker::new(QueuePolicy::DropNewest { capacity: 1 });
-        let mut queue = MessageQueue::<&'static str>::default();
-
-        let res1 = tracker.reserve_enqueue(Some(Arc::from("e1")));
-        let QueueReservation::Accepted { id: id1, .. } = res1 else {
-            panic!("e1 must be accepted");
-        };
-        queue.pending.push_back(QueuedMessage {
-            origin: QueueOrigin::External(id1),
-            message: "e1",
-        });
-
-        // External is saturated, new external is dropped newest
-        let res2 = tracker.reserve_enqueue(Some(Arc::from("e2")));
-        assert_eq!(res2, QueueReservation::DroppedNewest);
-
-        // Internal message is enqueued directly (guaranteed delivery)
-        queue.pending.push_back(QueuedMessage {
-            origin: QueueOrigin::Internal,
-            message: "i1",
-        });
-
-        let mut processed = Vec::new();
-        while let Some(queued) = queue.pending.pop_front() {
-            if let QueueOrigin::External(id) = queued.origin {
-                tracker.complete_processed(id);
-            }
-            processed.push(queued.message);
-        }
-
-        assert_eq!(processed, vec!["e1", "i1"]);
-        assert_eq!(tracker.depth(), 0);
     }
 }

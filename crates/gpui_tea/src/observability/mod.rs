@@ -65,12 +65,44 @@ impl<Msg> Observability<Msg> {
         self.config.describe_key_value(key)
     }
 
-    pub(crate) fn queue_warning_threshold(&self) -> Option<usize> {
-        self.config.queue_warning_threshold
-    }
-
     pub(crate) fn queue_policy(&self) -> QueuePolicy {
         self.config.queue_policy
+    }
+
+    pub(crate) fn drain_budget(&self) -> usize {
+        self.config.drain_budget
+    }
+
+    /// Emit a queue warning when `queued` exceeds the configured threshold.
+    pub(crate) fn observe_queue_depth(&self, queued: usize) {
+        let Some(threshold) = self.config.queue_warning_threshold else {
+            return;
+        };
+        if queued <= threshold {
+            return;
+        }
+
+        self.observe_runtime(RuntimeEvent::QueueWarning { queued, threshold });
+        self.observe_telemetry(TelemetryEvent::QueueWarning { queued, threshold });
+    }
+
+    /// Emit an overflow event for `action` to both observers.
+    pub(crate) fn observe_queue_overflow(
+        &self,
+        action: QueueOverflowAction,
+        message_description: Option<Arc<str>>,
+    ) {
+        let policy = self.queue_policy();
+        self.observe_runtime(RuntimeEvent::QueueOverflow {
+            policy,
+            action,
+            message_description: message_description.clone(),
+        });
+        self.observe_telemetry(TelemetryEvent::QueueOverflow {
+            policy,
+            action,
+            message_description,
+        });
     }
 
     pub(crate) fn observe_runtime(&self, event: RuntimeEvent<'_, Msg>) {

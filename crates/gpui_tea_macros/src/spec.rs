@@ -1,8 +1,9 @@
 use proc_macro2::Span;
 use quote::format_ident;
-use syn::{Expr, Generics, Ident, LitStr, Type};
+use syn::{Expr, Generics, Ident, LitStr, Type, Visibility};
 
 pub(crate) struct CompositeSpec {
+    pub(crate) struct_vis: Visibility,
     pub(crate) struct_ident: Ident,
     pub(crate) generics: Generics,
     pub(crate) message_ty: Type,

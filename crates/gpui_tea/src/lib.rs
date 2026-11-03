@@ -46,3 +46,9 @@ pub use program::{Program, RuntimeSnapshot};
 pub use scope::{ChildPath, ChildScope, ModelContext};
 pub use subscription::{SubHandle, Subscription, SubscriptionContext, Subscriptions};
 pub use view::{IntoView, View};
+
+/// Implementation details used by code generated with [`Composite`]. Not part of the public API.
+#[doc(hidden)]
+pub mod __private {
+    pub use gpui;
+}

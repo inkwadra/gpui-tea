@@ -4,6 +4,7 @@ use std::{sync::Arc, time::SystemTime};
 use super::{ProgramId, QueueOverflowAction, QueuePolicy};
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 /// Carry metadata emitted with each [`TelemetryEvent`].
 pub struct TelemetryMetadata {
     /// Identify the mounted program that emitted the event.
@@ -14,7 +15,8 @@ pub struct TelemetryMetadata {
     pub event_id: u64,
     /// Record when the event was emitted.
     pub emitted_at: SystemTime,
-    /// Snapshot the tracked queue depth at emission time.
+    /// Snapshot the queue depth at emission time: accepted messages that have not been processed
+    /// yet, external and internal combined.
     pub queue_depth: usize,
 }
 
@@ -28,6 +30,7 @@ pub struct TelemetryEnvelope<'a, Msg> {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 /// Describe detailed runtime telemetry intended for machine consumption.
 pub enum TelemetryEvent<'a, Msg> {
     /// A dispatch call was accepted by the runtime.
@@ -56,7 +59,7 @@ pub enum TelemetryEvent<'a, Msg> {
     },
     /// Queue depth is currently above the configured warning threshold.
     QueueWarning {
-        /// Report the current tracked queue depth.
+        /// Report the current queue depth, external and internal messages combined.
         queued: usize,
         /// Report the configured warning threshold.
         threshold: usize,
@@ -199,11 +202,20 @@ pub enum TelemetryEvent<'a, Msg> {
         /// Report how many messages were processed.
         processed: usize,
         /// Report how many messages remain queued.
+        ///
+        /// A non-zero value means the drain budget was exhausted and the remaining messages
+        /// were rescheduled on the foreground executor.
         remaining: usize,
     },
+    /// The program was dropped.
+    ///
+    /// Later dispatches fail with [`crate::Error::ProgramUnavailable`] and messages still
+    /// waiting in the queue are released.
+    ProgramUnmounted,
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 /// Describe high-level runtime events intended for application observers.
 pub enum RuntimeEvent<'a, Msg> {
     /// A dispatch call was accepted by the runtime.
@@ -235,7 +247,7 @@ pub enum RuntimeEvent<'a, Msg> {
     },
     /// Queue depth is currently above the configured warning threshold.
     QueueWarning {
-        /// Report the current tracked queue depth.
+        /// Report the current queue depth, external and internal messages combined.
         queued: usize,
         /// Report the configured warning threshold.
         threshold: usize,
@@ -352,6 +364,14 @@ pub enum RuntimeEvent<'a, Msg> {
         /// Report how many messages were processed.
         processed: usize,
         /// Report how many messages remain queued.
+        ///
+        /// A non-zero value means the drain budget was exhausted and the remaining messages
+        /// were rescheduled on the foreground executor.
         remaining: usize,
     },
+    /// The program was dropped.
+    ///
+    /// Later dispatches fail with [`crate::Error::ProgramUnavailable`] and messages still
+    /// waiting in the queue are released.
+    ProgramUnmounted,
 }

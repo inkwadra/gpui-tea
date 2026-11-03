@@ -2,17 +2,22 @@ use crate::command::{CommandInner, Effect};
 use crate::keyed_tasks::{CommandMeta, KeyedEffectContext};
 use crate::model::Model;
 use crate::observability::{Observability, ProgramConfig, RuntimeEvent, TelemetryEvent};
-use crate::queue::{AutoDrainGuard, DrainGuard, QueueOrigin, QueueTracker, QueuedMessage};
+use crate::queue::{
+    AutoDrainGuard, DrainGuard, InboxBatch, QueueOrigin, QueueTracker, QueuedMessage,
+};
 use crate::runtime::{EffectId, Runtime};
 use crate::{Command, CommandKind, Dispatcher, Key, ModelContext};
-use futures::StreamExt;
-use gpui::{App, AppContext, AsyncApp, Context, Entity, IntoElement, Render, Task, Window};
-use std::{fmt, sync::Arc};
+use gpui::{
+    App, AppContext, AsyncApp, Context, Entity, IntoElement, Render, Task, WeakEntity, Window,
+};
+use std::{fmt, future::poll_fn, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 /// Snapshot runtime bookkeeping for a mounted [`Program`].
 pub struct RuntimeSnapshot {
-    /// Report the current queue depth.
+    /// Report the number of accepted messages that have not been processed yet, external
+    /// dispatches and internal messages combined.
     pub queue_depth: usize,
     /// Report whether the runtime is actively draining queued messages.
     pub is_draining: bool,
@@ -24,12 +29,17 @@ pub struct RuntimeSnapshot {
 
 /// Host a mounted [`Model`] inside the GPUI runtime.
 ///
-/// # Panic Safety Contract
+/// Externally dispatched messages are handed to the program in batches: every message that is
+/// waiting when the program wakes up is processed in one drain, followed by a single
+/// subscription reconciliation and view notification. A drain processes at most
+/// [`ProgramConfig::drain_budget`] messages before yielding to the executor.
 ///
-/// If [`Model::update()`] panics during message queue draining, internal RAII guards
-/// automatically restore the queue's drain state (`is_draining = false`). Any remaining
-/// messages that were already queued in the program are retained in the pending queue and will be
-/// processed upon the next message dispatch.
+/// # Panics
+///
+/// A panic inside [`Model`] callbacks is not recoverable. It unwinds through GPUI's entity
+/// update, which leaves the program entity permanently leased: every later read or update of the
+/// entity panics as well. Treat panics in `init`, `update`, `view`, and `subscriptions` as fatal
+/// and report recoverable failures through messages instead.
 pub struct Program<M: Model> {
     model: M,
     runtime: Runtime<M::Msg>,
@@ -64,18 +74,19 @@ impl<M: Model> Program<M> {
                 move || queue_tracker.depth()
             }),
         );
-        let (sender, mut receiver) = futures::channel::mpsc::unbounded();
-        let dispatcher = Dispatcher::new(sender, queue_tracker.clone(), observability.clone());
+        let dispatcher = Dispatcher::new(queue_tracker.clone(), observability.clone());
         let program = cx.weak_entity();
+        let inbox = queue_tracker.clone();
         let receive_task = cx.spawn(move |_this, async_cx: &mut AsyncApp| {
             let mut async_cx = async_cx.clone();
             async move {
-                while let Some(message) = receiver.next().await {
-                    program
-                        .update(&mut async_cx, |program, cx| {
-                            program.receive_enqueued(message, cx);
-                        })
-                        .ok();
+                while let Some(batch) = poll_fn(|task_cx| inbox.poll_take(task_cx)).await {
+                    let delivered = program.update(&mut async_cx, |program, cx| {
+                        program.receive_external(batch, cx);
+                    });
+                    if delivered.is_err() {
+                        break;
+                    }
                 }
             }
         });
@@ -92,6 +103,7 @@ impl<M: Model> Program<M> {
     ///
     /// Mounting eagerly calls [`Model::init()`], executes the returned [`Command`] through the
     /// standard queue-drain model, and reconciles the initial subscriptions before returning.
+    /// Synchronous init messages beyond the drain budget are processed on the next executor turn.
     ///
     /// # Returns
     ///
@@ -110,6 +122,7 @@ impl<M: Model> Program<M> {
     ///
     /// Mounting eagerly calls [`Model::init()`], executes the returned [`Command`] through the
     /// standard queue-drain model, and reconciles the initial subscriptions before returning.
+    /// Synchronous init messages beyond the drain budget are processed on the next executor turn.
     ///
     /// # Returns
     ///
@@ -161,15 +174,16 @@ impl<M: Model> Program<M> {
         self.runtime.dispatcher.clone()
     }
 
-    fn receive_enqueued(&mut self, queued: QueuedMessage<M::Msg>, cx: &mut Context<'_, Self>) {
-        if let QueueOrigin::External(id) = queued.origin
-            && self.runtime.queue_tracker.take_if_dropped(id)
-        {
-            return;
-        }
-
-        self.runtime.queue.pending.push_back(queued);
-        self.observe_queue_warning_if_needed();
+    fn receive_external(&mut self, batch: InboxBatch<M::Msg>, cx: &mut Context<'_, Self>) {
+        // Moving messages from the inbox into the pending queue does not change the queue depth,
+        // so no warning is emitted here; dispatchers already reported it.
+        self.runtime
+            .queue
+            .pending
+            .extend(batch.into_iter().map(|(id, message)| QueuedMessage {
+                origin: QueueOrigin::External(id),
+                message,
+            }));
         if self.runtime.queue.should_auto_drain() {
             self.drain_queue(cx);
         }
@@ -180,28 +194,15 @@ impl<M: Model> Program<M> {
             origin: QueueOrigin::Internal,
             message,
         });
-        self.observe_queue_warning_if_needed();
+        let depth = self.runtime.queue_tracker.internal_enqueued();
+        self.runtime.observability.observe_queue_depth(depth);
         if self.runtime.queue.should_auto_drain() {
             self.drain_queue(cx);
         }
     }
 
-    fn observe_queue_warning_if_needed(&self) {
-        if let Some(threshold) = self.runtime.observability.queue_warning_threshold() {
-            let queued = self.runtime.queue.pending.len();
-            if queued > threshold {
-                self.runtime
-                    .observability
-                    .observe_runtime(RuntimeEvent::QueueWarning { queued, threshold });
-                self.runtime
-                    .observability
-                    .observe_telemetry(TelemetryEvent::QueueWarning { queued, threshold });
-            }
-        }
-    }
-
     fn drain_queue(&mut self, cx: &mut Context<'_, Self>) {
-        if self.runtime.queue.is_draining() {
+        if self.runtime.queue.is_draining() || self.runtime.queue.pending.is_empty() {
             return;
         }
 
@@ -214,15 +215,19 @@ impl<M: Model> Program<M> {
             .observability
             .observe_telemetry(TelemetryEvent::QueueDrainStarted { queued });
 
+        let budget = self.runtime.observability.drain_budget();
         let mut processed = 0;
 
-        while let Some(queued) = self.runtime.queue.pending.pop_front() {
-            if let QueueOrigin::External(id) = queued.origin {
-                if self.runtime.queue_tracker.take_if_dropped(id) {
-                    continue;
+        while processed < budget
+            && let Some(queued) = self.runtime.queue.pending.pop_front()
+        {
+            match queued.origin {
+                QueueOrigin::Internal => self.runtime.queue_tracker.internal_dequeued(),
+                QueueOrigin::External(id) => {
+                    if !self.runtime.queue_tracker.begin_processing(id) {
+                        continue;
+                    }
                 }
-
-                self.runtime.queue_tracker.complete_processed(id);
             }
             let message_description = self
                 .runtime
@@ -266,6 +271,31 @@ impl<M: Model> Program<M> {
                 processed,
                 remaining,
             });
+
+        if remaining > 0 {
+            self.schedule_drain_continuation(cx);
+        }
+    }
+
+    /// Resume draining on a later executor turn after a drain exhausted its budget.
+    fn schedule_drain_continuation(&mut self, cx: &mut Context<'_, Self>) {
+        if self.runtime.drain_continuation.is_some() {
+            return;
+        }
+
+        let task = cx.spawn(move |this: WeakEntity<Self>, async_cx: &mut AsyncApp| {
+            let mut async_cx = async_cx.clone();
+            async move {
+                this.update(&mut async_cx, |program, cx| {
+                    program.runtime.drain_continuation = None;
+                    if program.runtime.queue.should_auto_drain() {
+                        program.drain_queue(cx);
+                    }
+                })
+                .ok();
+            }
+        });
+        self.runtime.drain_continuation = Some(task);
     }
 
     fn execute_command(&mut self, command: Command<M::Msg>, cx: &mut Context<'_, Self>) {

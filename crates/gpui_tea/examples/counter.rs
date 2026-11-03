@@ -2,7 +2,8 @@
 #[path = "utils/ui.rs"]
 mod ui;
 
-use gpui::{App, Application, Bounds, Window, WindowBounds, WindowOptions, prelude::*, px, size};
+use gpui::{App, Bounds, Window, WindowBounds, WindowOptions, prelude::*, px, size};
+use gpui_platform::application;
 use gpui_tea::{Command, Dispatcher, IntoView, Model, ModelContext, Program, View};
 
 #[derive(Clone, Copy)]
@@ -89,7 +90,7 @@ impl Model for Counter {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    application().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
 
         cx.open_window(

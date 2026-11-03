@@ -3,6 +3,7 @@ use gpui::App;
 use std::{collections::HashSet, fmt, sync::Arc};
 
 /// Hold the runtime resource that keeps a subscription alive.
+#[non_exhaustive]
 pub enum SubHandle {
     /// Hold a GPUI subscription token.
     Subscription(gpui::Subscription),
@@ -417,9 +418,9 @@ impl<Msg> fmt::Debug for Subscriptions<Msg> {
 mod tests {
     use super::*;
     use crate::{ProgramConfig, QueuePolicy, observability::Observability, queue::QueueTracker};
-    use futures::{FutureExt, StreamExt, channel::mpsc::unbounded};
+    use futures::task::noop_waker;
     use gpui::TestAppContext;
-    use std::sync::Arc;
+    use std::{sync::Arc, task::Poll};
 
     #[test]
     fn batch_returns_duplicate_key_error() {
@@ -484,7 +485,6 @@ mod tests {
             Fire(&'static str),
         }
 
-        let (sender, mut receiver) = unbounded();
         let queue_tracker = Arc::new(QueueTracker::new(QueuePolicy::Unbounded));
         let observability = Observability::new(
             ProgramConfig::default(),
@@ -493,7 +493,7 @@ mod tests {
                 move || queue_tracker.depth()
             }),
         );
-        let dispatcher = Dispatcher::new(sender, queue_tracker, observability);
+        let dispatcher = Dispatcher::new(queue_tracker.clone(), observability);
         let mapped = Subscription::new("mapped", |cx| {
             cx.dispatch(InnerMsg::Fire("payload"))
                 .expect("the mapped dispatcher should be alive while building the subscription");
@@ -513,12 +513,13 @@ mod tests {
             assert!(matches!(handle, SubHandle::None));
         });
 
-        cx.run_until_parked();
-        let message = receiver
-            .next()
-            .now_or_never()
-            .flatten()
-            .map(|queued| queued.message);
-        assert_eq!(message, Some(OuterMsg::Wrapped("payload")));
+        let waker = noop_waker();
+        let Poll::Ready(Some(batch)) =
+            queue_tracker.poll_take(&mut std::task::Context::from_waker(&waker))
+        else {
+            panic!("the mapped dispatch must reach the inbox");
+        };
+        let messages = batch.into_iter().map(|(_, msg)| msg).collect::<Vec<_>>();
+        assert_eq!(messages, vec![OuterMsg::Wrapped("payload")]);
     }
 }

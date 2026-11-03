@@ -1,9 +1,8 @@
 use crate::{
     Error, Result,
     observability::{Observability, QueueOverflowAction, RuntimeEvent, TelemetryEvent},
-    queue::{QueueOrigin, QueueReservation, QueueTracker, QueuedMessage},
+    queue::{EnqueueOutcome, QueueTracker},
 };
-use futures::channel::mpsc::UnboundedSender;
 use std::fmt;
 use std::sync::Arc;
 
@@ -20,88 +19,54 @@ pub struct Dispatcher<Msg> {
 
 impl<Msg: Send + 'static> Dispatcher<Msg> {
     /// Create a new dispatcher.
-    pub(crate) fn new(
-        sender: UnboundedSender<QueuedMessage<Msg>>,
-        queue_tracker: Arc<QueueTracker>,
-        observability: Observability<Msg>,
-    ) -> Self {
+    pub(crate) fn new(queue: Arc<QueueTracker<Msg>>, observability: Observability<Msg>) -> Self {
         Self {
             dispatch: Arc::new(move |msg: Msg| {
                 let message_description = observability.describe_message_value(&msg);
-                let reservation = queue_tracker.reserve_enqueue(message_description.clone());
 
-                match reservation {
-                    QueueReservation::Rejected => {
-                        observability.observe_runtime(RuntimeEvent::QueueOverflow {
-                            policy: observability.queue_policy(),
-                            action: QueueOverflowAction::RejectedNew,
+                match queue.offer(msg, message_description.clone()) {
+                    EnqueueOutcome::Accepted { depth, displaced } => {
+                        if let Some(displaced) = displaced {
+                            // Release the displaced message here, outside the queue lock.
+                            drop(displaced.message);
+                            observability.observe_queue_overflow(
+                                QueueOverflowAction::DroppedOldest,
+                                displaced.description,
+                            );
+                        }
+                        observability.observe_runtime(RuntimeEvent::DispatchAccepted {
                             message_description: message_description.clone(),
                         });
-                        observability.observe_telemetry(TelemetryEvent::QueueOverflow {
-                            policy: observability.queue_policy(),
-                            action: QueueOverflowAction::RejectedNew,
-                            message_description: message_description.clone(),
+                        observability.observe_telemetry(TelemetryEvent::DispatchAccepted {
+                            message_description,
                         });
+                        observability.observe_queue_depth(depth);
+                        Ok(())
+                    }
+                    EnqueueOutcome::Rejected(_) => {
+                        observability.observe_queue_overflow(
+                            QueueOverflowAction::RejectedNew,
+                            message_description,
+                        );
                         Err(Error::QueueFull {
                             policy: observability.queue_policy(),
                         })
                     }
-                    QueueReservation::DroppedNewest => {
-                        observability.observe_runtime(RuntimeEvent::QueueOverflow {
-                            policy: observability.queue_policy(),
-                            action: QueueOverflowAction::DroppedNewest,
-                            message_description: message_description.clone(),
-                        });
-                        observability.observe_telemetry(TelemetryEvent::QueueOverflow {
-                            policy: observability.queue_policy(),
-                            action: QueueOverflowAction::DroppedNewest,
+                    EnqueueOutcome::DroppedNewest(_) => {
+                        observability.observe_queue_overflow(
+                            QueueOverflowAction::DroppedNewest,
                             message_description,
-                        });
+                        );
                         Ok(())
                     }
-                    ref accepted @ QueueReservation::Accepted {
-                        id,
-                        overflow_action,
-                        ref dropped_message_description,
-                        ..
-                    } => {
-                        let result = sender
-                            .unbounded_send(QueuedMessage {
-                                origin: QueueOrigin::External(id),
-                                message: msg,
-                            })
-                            .map_err(|_| Error::ProgramUnavailable);
-
-                        if let Ok(()) = &result {
-                            if let Some(action) = overflow_action {
-                                observability.observe_runtime(RuntimeEvent::QueueOverflow {
-                                    policy: observability.queue_policy(),
-                                    action,
-                                    message_description: dropped_message_description.clone(),
-                                });
-                                observability.observe_telemetry(TelemetryEvent::QueueOverflow {
-                                    policy: observability.queue_policy(),
-                                    action,
-                                    message_description: dropped_message_description.clone(),
-                                });
-                            }
-                            observability.observe_runtime(RuntimeEvent::DispatchAccepted {
-                                message_description: message_description.clone(),
-                            });
-                            observability.observe_telemetry(TelemetryEvent::DispatchAccepted {
-                                message_description,
-                            });
-                        } else {
-                            queue_tracker.rollback_enqueue(accepted);
-                            observability.observe_runtime(RuntimeEvent::DispatchRejected {
-                                message_description: message_description.clone(),
-                            });
-                            observability.observe_telemetry(TelemetryEvent::DispatchRejected {
-                                message_description,
-                            });
-                        }
-
-                        result
+                    EnqueueOutcome::Closed(_) => {
+                        observability.observe_runtime(RuntimeEvent::DispatchRejected {
+                            message_description: message_description.clone(),
+                        });
+                        observability.observe_telemetry(TelemetryEvent::DispatchRejected {
+                            message_description,
+                        });
+                        Err(Error::ProgramUnavailable)
                     }
                 }
             }),
@@ -172,11 +137,7 @@ impl<Msg> fmt::Debug for Dispatcher<Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        observability::{ProgramConfig, QueuePolicy},
-        queue::QueueTracker,
-    };
-    use futures::channel::mpsc::unbounded;
+    use crate::observability::{ProgramConfig, QueuePolicy};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,7 +149,19 @@ mod tests {
     enum DispatchEvent {
         Accepted(Option<String>),
         Rejected(Option<String>),
-        Overflow(String),
+        Warning { queued: usize, threshold: usize },
+    }
+
+    fn dispatcher(config: ProgramConfig<Msg>) -> (Dispatcher<Msg>, Arc<QueueTracker<Msg>>) {
+        let queue = Arc::new(QueueTracker::new(config.queue_policy));
+        let observability = Observability::new(
+            config,
+            Arc::new({
+                let queue = queue.clone();
+                move || queue.depth()
+            }),
+        );
+        (Dispatcher::new(queue.clone(), observability), queue)
     }
 
     #[test]
@@ -219,39 +192,12 @@ mod tests {
                         )),
                     _ => {}
                 }
-            })
-            .telemetry_observer({
-                let dispatch_events = dispatch_events.clone();
-                move |event| {
-                    if let TelemetryEvent::QueueOverflow {
-                        message_description,
-                        ..
-                    } = event.event
-                    {
-                        dispatch_events
-                            .lock()
-                            .unwrap()
-                            .push(DispatchEvent::Overflow(message_description.map_or_else(
-                                || String::from("<none>"),
-                                |value| value.to_string(),
-                            )));
-                    }
-                }
             });
 
-        let queue_tracker = Arc::new(QueueTracker::new(QueuePolicy::Unbounded));
-        let observability = Observability::new(
-            config,
-            Arc::new({
-                let queue_tracker = queue_tracker.clone();
-                move || queue_tracker.depth()
-            }),
-        );
-        let (sender, receiver) = unbounded();
-        let dispatcher = Dispatcher::new(sender, queue_tracker, observability);
+        let (dispatcher, queue) = dispatcher(config);
 
         assert_eq!(dispatcher.dispatch(Msg::Set(1)), Ok(()));
-        drop(receiver);
+        queue.close();
 
         let error = dispatcher.dispatch(Msg::Set(2)).unwrap_err();
         assert_eq!(error, Error::ProgramUnavailable);
@@ -267,18 +213,9 @@ mod tests {
 
     #[test]
     fn dispatch_returns_queue_full_when_policy_rejects_new_messages() {
-        let config =
-            ProgramConfig::<Msg>::default().queue_policy(QueuePolicy::RejectNew { capacity: 0 });
-        let queue_tracker = Arc::new(QueueTracker::new(QueuePolicy::RejectNew { capacity: 0 }));
-        let observability = Observability::new(
-            config,
-            Arc::new({
-                let queue_tracker = queue_tracker.clone();
-                move || queue_tracker.depth()
-            }),
+        let (dispatcher, _queue) = dispatcher(
+            ProgramConfig::<Msg>::default().queue_policy(QueuePolicy::RejectNew { capacity: 0 }),
         );
-        let (sender, _receiver) = unbounded();
-        let dispatcher = Dispatcher::new(sender, queue_tracker, observability);
 
         let error = dispatcher.dispatch(Msg::Set(7)).unwrap_err();
         assert_eq!(
@@ -286,6 +223,43 @@ mod tests {
             Error::QueueFull {
                 policy: QueuePolicy::RejectNew { capacity: 0 },
             }
+        );
+    }
+
+    #[test]
+    fn dispatch_warns_when_the_external_backlog_exceeds_the_threshold() {
+        let dispatch_events = Arc::new(Mutex::new(Vec::new()));
+        let config = ProgramConfig::default()
+            .queue_warning_threshold(1)
+            .observer({
+                let dispatch_events = dispatch_events.clone();
+                move |event| {
+                    if let RuntimeEvent::QueueWarning { queued, threshold } = event {
+                        dispatch_events
+                            .lock()
+                            .unwrap()
+                            .push(DispatchEvent::Warning { queued, threshold });
+                    }
+                }
+            });
+        let (dispatcher, _queue) = dispatcher(config);
+
+        for value in 0..3 {
+            dispatcher.dispatch(Msg::Set(value)).unwrap();
+        }
+
+        assert_eq!(
+            dispatch_events.lock().unwrap().as_slice(),
+            &[
+                DispatchEvent::Warning {
+                    queued: 2,
+                    threshold: 1,
+                },
+                DispatchEvent::Warning {
+                    queued: 3,
+                    threshold: 1,
+                },
+            ]
         );
     }
 }

@@ -13,10 +13,8 @@ fn main() {
 #[cfg(feature = "tracing")]
 mod enabled {
     use super::ui;
-    use gpui::{
-        App, Application, Bounds, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgba,
-        size,
-    };
+    use gpui::{App, Bounds, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgba, size};
+    use gpui_platform::application;
     use gpui_tea::{
         Command, Dispatcher, IntoView, Model, ModelContext, Program, ProgramConfig, View,
         observe_tracing_telemetry,
@@ -301,7 +299,7 @@ mod enabled {
             .compact()
             .try_init();
 
-        Application::new().run(|cx: &mut App| {
+        application().run(|cx: &mut App| {
             let bounds = Bounds::centered(None, size(px(960.0), px(760.0)), cx);
             let config = ProgramConfig::new()
                 .describe_program(|program_id| format!("program:{program_id}"))
